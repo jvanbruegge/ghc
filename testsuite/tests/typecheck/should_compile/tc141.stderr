@@ -38,13 +38,12 @@ tc141.hs:13:13: error:
 
 tc141.hs:15:18: error:
     • Couldn't match expected type ‘a1’ with actual type ‘p1’
-        because type variable ‘a1’ would escape its scope
-      This (rigid, skolem) type variable is bound by
+      ‘a1’ is a rigid type variable bound by
         the type signature for:
           v :: forall a1. a1
         at tc141.hs:14:14-19
-      ‘p’ is a rigid type variable bound by
-        the inferred type of g :: a -> p -> a1
+      ‘p1’ is a rigid type variable bound by
+        the inferred type of g :: p -> p1 -> a
         at tc141.hs:(13,1)-(16,13)
     • In the expression: b
       In an equation for ‘v’: v = b
