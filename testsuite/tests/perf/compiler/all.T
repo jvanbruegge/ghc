@@ -39,7 +39,7 @@ test('T1969',
              # 2013-11-13 17 (x86/Windows, 64bit machine)
              # 2015-07-11 21 (x86/Linux, 64bit machine) use +RTS -G1
              # 2016-04-06 30 (x86/Linux, 64bit machine)
-           (wordsize(64), 78, 20)]),
+           (wordsize(64), 73, 20)]),
              #            28 (amd64/Linux)
              #            34 (amd64/Linux)
              # 2012-09-20 23 (amd64/Linux)
@@ -56,6 +56,7 @@ test('T1969',
              # 2017-02-17 83  (amd64/Linux) Type-indexed Typeable
              # 2017-03-31 61  (amd64/Linux) Fix memory leak in simplifier
              # 2018-01-25 78  (amd64/Linux) Use CoreExpr for EvTerm
+             # 2018-07-10 73  (amd64/Linux) Fix space leaks
       compiler_stats_num_field('max_bytes_used',
           [(platform('i386-unknown-mingw32'), 5719436, 20),
                                  # 2010-05-17 5717704 (x86/Windows)
@@ -73,7 +74,7 @@ test('T1969',
              # 2017-03-24 9261052 (x86/Linux, 64-bit machine)
              # 2017-04-06 9418680 (x86/Linux, 64-bit machine)
 
-           (wordsize(64), 22311600, 15)]),
+           (wordsize(64), 19738608, 15)]),
              # 2014-09-10 10463640, 10  # post-AMP-update (somewhat stabelish)
                # looks like the peak is around ~10M, but we're
                # unlikely to GC exactly on the peak.
@@ -90,6 +91,7 @@ test('T1969',
              # 2017-03-31 16679176 Fix memory leak in simplifier
              # 2017-08-25 19199872 Refactor the Mighty Simplifier
              # 2018-02-19 22311600 (amd64/Linux) Unknown
+             # 2018-07-10 19738608 (amd64/Linux) Fix space leaks
 
       compiler_stats_num_field('bytes allocated',
           [(platform('i386-unknown-mingw32'), 301784492, 5),
@@ -108,7 +110,7 @@ test('T1969',
              # 2015-07-11 288699104 (x86/Linux, 64-bit machine) use +RTS -G1
              # 2016-04-06 344730660 (x86/Linux, 64-bit machine)
              # 2017-03-24 324586096 (x86/Linux, 64-bit machine)
-           (wordsize(64), 659863176, 5)]),
+           (wordsize(64), 670839456, 5)]),
              # 2009-11-17 434845560 (amd64/Linux)
              # 2009-12-08 459776680 (amd64/Linux)
              # 2010-05-17 519377728 (amd64/Linux)
@@ -132,6 +134,7 @@ test('T1969',
              # 2017-02-17 831733376 (x86_64/Linux) Type-indexed Typeable
              # 2017-02-25 695354904 (x86_64/Linux) Early inlining patch
              # 2017-04-21 659863176 (x86_64/Linux) Unknown
+             # 2018-07-10 670839456 (x86_64/Linux) Unknown (just updating)
       only_ways(['normal']),
 
       extra_hc_opts('-dcore-lint -static'),
@@ -449,7 +452,7 @@ test('T5631',
         # 2014-04-04:     346389856 (x86 Windows, 64 bit machine)
         # 2014-12-01:     390199244 (Windows laptop)
         # 2016-04-06:     570137436 (amd64/Linux) many reasons
-           (wordsize(64), 1106015512, 5)]),
+           (wordsize(64), 1161885448, 5)]),
         # expected value: 774595008 (amd64/Linux):
         # expected value: 735486328 (amd64/Linux) 2012/12/12:
         # expected value: 690742040 (amd64/Linux) Call Arity improvements
@@ -464,8 +467,9 @@ test('T5631',
         # 2017-02-17:     1517484488 (amd64/Linux) Type-indexed Typeable
         # 2017-03-03:     1065147968 (amd64/Linux) Share Typeable KindReps
         # 2017-03-31:     1037482512 (amd64/Linux) Fix memory leak in simplifier
-	# 2017-07-27:     1106015512 (Mac) Regresssion from tracking visibility in TypeEqOrigin
-	#                                  should be fixed by #14037
+        # 2017-07-27:     1106015512 (Mac) Regresssion from tracking visibility in TypeEqOrigin
+        #                                  should be fixed by #14037
+        # 2018-06-18:     1161885448 (Mac) Not entirely clear
        only_ways(['normal'])
       ],
      compile,
@@ -595,7 +599,7 @@ test('T5321FD',
             #  (due to better optCoercion, 5e7406d9, #9233)
             # 2016-04-06: 250757460 (x86/Linux)
 
-           (wordsize(64), 415136648, 10)])
+           (wordsize(64), 371826136, 10)])
             # prev:       418306336
             # 29/08/2012: 492905640
             #  (increase due to new codegen)
@@ -617,6 +621,7 @@ test('T5321FD',
             # 2016-07-16: 477840432
             #  Optimize handling of built-in OccNames
             # 2017-05-14: 415136648 (amd64/Linux) Two-pass CmmLayoutStack
+            # 2018-04-24: 371826136 (amd64/Linux) Store size in LitString
       ],
       compile,[''])
 
@@ -722,7 +727,7 @@ test('T6048',
             # 2014-12-01: 49987836 (x86 Windows)
             # 2016-04-06: 55701280 (x86/Linux, 64-bit machine)
 
-           (wordsize(64), 90996312, 10)])
+           (wordsize(64), 100574504, 10)])
              # 2012-09-18  97247032 amd64/Linux
              # 2014-01-16 108578664 amd64/Linux (unknown, likely foldl-via-foldr)
              # 2014-01-18  95960720 amd64/Linux Call Arity improvements
@@ -735,7 +740,8 @@ test('T6048',
              # 2016-03-11 108225624 amd64/Linux unknown reason sadly; likely gradual creep.
              # 2016-11-25  94327392 amd64/Linux Back down again hooray; still not sure why
              # 2017-02-17 115715592 amd64/Linux Type-indexed Typeable
-             # 2017-04-28 90996312 Join point refactoring
+             # 2017-04-28  90996312 Join point refactoring
+             # 2018-06-18 100574504 Darwin      Unclear
       ],
       compile,[''])
 
@@ -747,7 +753,7 @@ test('T9020',
            # 2014-07-31:  343005716 (Windows) (general round of updates)
            # 2017-03-24:  249904136 (x86/Linux, 64-bit machine)
 
-           (wordsize(64), 562206104, 10)])
+           (wordsize(64), 391876936, 10)])
            # prev:        795469104
            # 2014-07-17:  728263536 (general round of updates)
            # 2014-09-10:  785871680 post-AMP-cleanup
@@ -762,6 +768,7 @@ test('T9020',
            # 2017-03-31:  493596312 Fix memory leak in simplifier
            # 2017-04-28:  423163832  Remove exponential behaviour in simplifier
            # 2018-04-09:  562206104 Inexplicable, collateral of #14737
+           # 2018-05-14:  391876936 Improved simplCast performance #15019
       ],
       compile,[''])
 
@@ -887,7 +894,7 @@ test('T9872c',
 test('T9872d',
      [ only_ways(['normal']),
        compiler_stats_num_field('bytes allocated',
-          [(wordsize(64), 572537984, 5),
+          [(wordsize(64), 578498120, 5),
           # 2014-12-18    796071864   Initally created
           # 2014-12-18    739189056   Reduce type families even more eagerly
           # 2015-01-07    687562440   TrieMap leaf compression
@@ -902,6 +909,7 @@ test('T9872d',
           # 2017-03-03    462817352   Share Typeable KindReps
           # 2018-03-25    526485920   Flattener patch does more work (#12919)
           # 2018-04-11    572537984   simplCast improvement collateral (#11735)
+          # 2018-07-04    578498120   introduce GRefl (#15192)
 
            (wordsize(32), 232954000, 5)
           # some date     328810212
@@ -940,7 +948,7 @@ test('T9961',
 test('T9233',
     [ only_ways(['normal']),
       compiler_stats_num_field('bytes allocated',
-        [(wordsize(64),  924299320, 5),
+        [(wordsize(64),  973149832, 5),
          # 2015-08-04    999826288     initial value
          # 2016-04-14   1066246248     Final demand analyzer run
          # 2016-06-18    984268712     shuffling around of Data.Functor.Identity
@@ -952,6 +960,7 @@ test('T9233',
          # 2017-02-07    884436192     Another improvement to SetLevels
          # 2017-02-17    974530192     Type-indexed Typeable
          # 2017-03-21    924299320     It's unclear
+         # 2018-06-09    973149832     It's unclear
 
          (wordsize(32),  460112888, 5)
          # 2016-04-06    515672240     (x86/Linux) initial value
@@ -1040,7 +1049,7 @@ test('T12227',
 test('T12425',
      [ only_ways(['optasm']),
        compiler_stats_num_field('bytes allocated',
-          [(wordsize(64), 141952368, 5),
+          [(wordsize(64), 139100464, 5),
           # initial:      125831400
           # 2017-01-18:   133380960  Allow top-level string literals in Core
           # 2017-02-17:   153611448  Type-indexed Typeable
@@ -1049,6 +1058,8 @@ test('T12425',
           # 2017-04-28:   127500136  Remove exponential behaviour in simplifier
           # 2017-05-23:   134780272  Addition of llvm-targets in dynflags (D3352)
           # 2018-04-15:   141952368  Collateral of #14737
+          # 2018-04-26:   150743648  Do not unpack class dictionaries with INLINABLE
+          # 2018-05-14:   139100464  improved simplCast performance #15019
           ]),
      ],
      compile,
@@ -1061,7 +1072,8 @@ test('T12234',
           # initial:      83032768
           # 2017-02-19    89180624 (x64/Windows) - Unknown
           # 2017-02-25    79889200 (x64/Windows) - Early inline patch
-           (wordsize(64), 81696664, 5),
+          # 2018-05-04    86938328 (x64/Windows) - Unknown and horrible
+           (wordsize(64), 85961968, 5),
           # initial:      72958288
           # 2016-01-17:   76848856  (x86-64, Linux. drift?)
           # 2017-02-01:   80882208  (Use superclass instances when solving)
@@ -1069,6 +1081,7 @@ test('T12234',
           # 2017-02-17:   86525344  (Type-indexed Typeable)
           # 2017-02-25:   83032768  (Early inline patch)
           # 2017-09-07:   81696664  (Semigroup=>Monoid patch, D3927)
+          # 2018-04-26:   85961968  (Do not unpack class dictionaries with INLINABLE)
           ]),
      ],
      compile,
@@ -1088,7 +1101,7 @@ test('T12545',
 test('T13035',
      [ only_ways(['normal']),
        compiler_stats_num_field('bytes allocated',
-          [(wordsize(64), 118665640, 5),
+          [(wordsize(64), 125020728, 5),
           # 2017-01-05   90595208  initial
           # 2017-01-19   95269000  Allow top-level string literals in Core
           # 2017-02-05   88806416  Probably OccAnal fixes
@@ -1096,6 +1109,7 @@ test('T13035',
           # 2017-02-25   98390488  Early inline patch
           # 2017-03-21   93249744  It's unclear
           # 2017-07-19   118665640 Generate Typeable bindings for data instances
+          # 2018-06-10   125020728 It's unclear
           ]),
      ],
      compile,
@@ -1118,7 +1132,7 @@ test('T13056',
 
 test('T12707',
      [ compiler_stats_num_field('bytes allocated',
-          [(wordsize(64), 1237898376, 5),
+          [(wordsize(64), 1141555816, 5),
           # initial:    1271577192
           # 2017-01-22: 1348865648  Allow top-level strings in Core
           # 2017-01-31: 1280336112  Join points (#12988)
@@ -1127,6 +1141,7 @@ test('T12707',
           # 2017-03-02: 1231809592  Drift from recent simplifier improvements
           # 2017-05-14: 1163821528  (amd64/Linux) Two-pass CmmLayoutStack
           # 2018-04-09: 1237898376  Inexplicable, collateral of #14737
+          # 2018-04-30: 1141555816  improved simplCast performance #15019
           ]),
      ],
      compile,
@@ -1135,11 +1150,12 @@ test('T12707',
 test('T12150',
      [ only_ways(['optasm']),
        compiler_stats_num_field('bytes allocated',
-          [(wordsize(64), 73769936, 5)
+          [(wordsize(64), 77557800, 5)
           # initial:    70773000
           # 2017-08-25: 74358208  Refactor the Mighty Simplifier
           # 2017-08-25: 78300680  Drift
           # 2017-10-25: 73769936  amd64/linux Fix space leak in BinIface.getSymbolTable
+          # 2018-04-26: 77557800  Do not unpack class dictionaries with INLINABLE
           ]),
      ],
     compile,
@@ -1197,13 +1213,16 @@ test('ManyAlternatives',
 
 test('T13701',
      [ compiler_stats_num_field('bytes allocated',
-          [(platform('x86_64-apple-darwin'), 2217187888, 10),
-           (platform('x86_64-unknown-linux'), 2133380768, 10),
+          [(platform('x86_64-apple-darwin'), 2549206272, 10),
+           (platform('x86_64-unknown-linux'), 2413253392, 10),
            # initial:     2511285600
            # 2017-06-23:  2188045288    treat banged variable bindings as FunBinds
            # 2017-07-11:  2187920960
            # 2017-07-12:  2412223768    inconsistency between Ben's machine and Harbormaster?
            # 2017-07-17:  2133380768    Resolved the issue causing the inconsistencies in this test
+           # 2018-05-09:  2413253392    D4659 (Fix GHCi space leaks) added
+           #                            some strictness which causes some extra
+           #                            work to be done in this test.
           ]),
        pre_cmd('./genT13701'),
        extra_files(['genT13701']),
@@ -1225,10 +1244,13 @@ test('T13719',
 
 test('T14697',
      [ compiler_stats_num_field('bytes allocated',
-          [(wordsize(64), 337290376, 10),
+          [(wordsize(64), 371030912, 10),
           # initial:    635573784
           # 2018-02-23: 337290376 Cache the fingerprint of sOpt_P
+          # 2018-05-24: 371030912 Unknown
           ]),
+       # This generates too large of a command-line for poor Windows
+       when(opsys('mingw32'), expect_broken(15072)),
        pre_cmd('./genT14697'),
        extra_files(['genT14697']),
        extra_hc_opts('$(cat T14697-flags)'), # 10k -optP arguments
@@ -1272,3 +1294,13 @@ test ('T9630',
       ],
       multimod_compile,
       ['T9630', '-v0 -O'])
+
+test ('T15164',
+      [ compiler_stats_num_field('bytes allocated',
+          [(wordsize(64), 1945564312, 10)
+          # initial:      3423873408
+          # 2018-05-22:   1945564312   Fix bottleneck in CallArity
+          ])
+      ],
+      compile,
+      ['-v0 -O'])

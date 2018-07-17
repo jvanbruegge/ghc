@@ -48,6 +48,7 @@ import GhcMonad ( modifySession )
 import qualified GHC
 import GHC ( LoadHowMuch(..), Target(..),  TargetId(..), InteractiveImport(..),
              TyThing(..), Phase, BreakIndex, Resume, SingleStep, Ghc,
+             GetDocsFailure(..),
              getModuleGraph, handleSourceError )
 import HsImpExp
 import HsSyn
@@ -99,6 +100,7 @@ import Data.List ( find, group, intercalate, intersperse, isPrefixOf, nub,
                    partition, sort, sortBy )
 import qualified Data.Set as S
 import Data.Maybe
+import Data.Map (Map)
 import qualified Data.Map as M
 import Data.Time.LocalTime ( getZonedTime )
 import Data.Time.Format ( formatTime, defaultTimeLocale )
@@ -133,6 +135,8 @@ import qualified System.Win32
 import GHC.IO.Exception ( IOErrorType(InvalidArgument) )
 import GHC.IO.Handle ( hFlushAll )
 import GHC.TopHandler ( topHandler )
+
+import GHCi.Leak
 
 -----------------------------------------------------------------------------
 
@@ -177,6 +181,7 @@ ghciCommands = map mkCmd [
   ("def",       keepGoing (defineMacro False),  completeExpression),
   ("def!",      keepGoing (defineMacro True),   completeExpression),
   ("delete",    keepGoing deleteCmd,            noCompletion),
+  ("doc",       keepGoing' docCmd,              completeIdentifier),
   ("edit",      keepGoing' editFile,            completeFilename),
   ("etags",     keepGoing createETagsFileCmd,   completeFilename),
   ("force",     keepGoing forceCmd,             completeExpression),
@@ -286,6 +291,7 @@ defFullHelpText =
   "                               (!: use regex instead of line number)\n" ++
   "   :def <cmd> <expr>           define command :<cmd> (later defined command has\n" ++
   "                               precedence, ::<cmd> is always a builtin command)\n" ++
+  "   :doc <name>                 display docs for the given name (experimental)\n" ++
   "   :edit <file>                edit file\n" ++
   "   :edit                       edit last module\n" ++
   "   :etags [<file>]             create tags file <file> for Emacs (default: \"TAGS\")\n" ++
@@ -791,16 +797,14 @@ checkPromptStringForErrors (_:xs) = checkPromptStringForErrors xs
 checkPromptStringForErrors "" = Nothing
 
 generatePromptFunctionFromString :: String -> PromptFunction
-generatePromptFunctionFromString promptS = \_ _ -> do
-    (context, modules_names, line) <- getInfoForPrompt
-
-    let
+generatePromptFunctionFromString promptS modules_names line =
+        processString promptS
+  where
         processString :: String -> GHCi SDoc
         processString ('%':'s':xs) =
             liftM2 (<>) (return modules_list) (processString xs)
             where
-              modules_list = context <> modules_bit
-              modules_bit = hsep $ map text modules_names
+              modules_list = hsep $ map text modules_names
         processString ('%':'l':xs) =
             liftM2 (<>) (return $ ppr line) (processString xs)
         processString ('%':'d':xs) =
@@ -860,8 +864,6 @@ generatePromptFunctionFromString promptS = \_ _ -> do
             liftM (char x <>) (processString xs)
         processString "" =
             return empty
-
-    processString promptS
 
 mkPrompt :: GHCi String
 mkPrompt = do
@@ -1083,6 +1085,10 @@ enqueueCommands cmds = do
 runStmt :: String -> SingleStep -> GHCi (Maybe GHC.ExecResult)
 runStmt stmt step = do
   dflags <- GHC.getInteractiveDynFlags
+  -- In GHCi, we disable `-fdefer-type-errors`, as well as `-fdefer-type-holes`
+  -- and `-fdefer-out-of-scope-variables` for **naked expressions**. The
+  -- declarations and statements are not affected.
+  -- See Note [Deferred type errors in GHCi] in typecheck/TcRnDriver.hs
   if | GHC.isStmt dflags stmt    -> run_stmt
      | GHC.isImport dflags stmt  -> run_import
      -- Every import declaration should be handled by `run_import`. As GHCi
@@ -1606,6 +1612,38 @@ checkModule m = do
           return True
   afterLoad (successIf ok) False
 
+-----------------------------------------------------------------------------
+-- :doc
+
+docCmd :: String -> InputT GHCi ()
+docCmd "" =
+  throwGhcException (CmdLineError "syntax: ':doc <thing-you-want-docs-for>'")
+docCmd s  = do
+  -- TODO: Maybe also get module headers for module names
+  names <- GHC.parseName s
+  e_docss <- mapM GHC.getDocs names
+  sdocs <- mapM (either handleGetDocsFailure (pure . pprDocs)) e_docss
+  let sdocs' = vcat (intersperse (text "") sdocs)
+  unqual <- GHC.getPrintUnqual
+  dflags <- getDynFlags
+  (liftIO . putStrLn . showSDocForUser dflags unqual) sdocs'
+
+-- TODO: also print arg docs.
+pprDocs :: (Maybe HsDocString, Map Int HsDocString) -> SDoc
+pprDocs (mb_decl_docs, _arg_docs) =
+  maybe
+    (text "<has no documentation>")
+    (text . unpackHDS)
+    mb_decl_docs
+
+handleGetDocsFailure :: GHC.GhcMonad m => GetDocsFailure -> m SDoc
+handleGetDocsFailure no_docs = do
+  dflags <- getDynFlags
+  let msg = showPpr dflags no_docs
+  throwGhcException $ case no_docs of
+    NameHasNoModule {} -> Sorry msg
+    NoDocsInIface {} -> InstallationError msg
+    InteractiveName -> ProgramError msg
 
 -----------------------------------------------------------------------------
 -- :load, :add, :reload
@@ -1646,6 +1684,15 @@ loadModule' files = do
   -- require some re-working of the GHC interface, so we'll leave it
   -- as a ToDo for now.
 
+  hsc_env <- GHC.getSession
+
+  -- Grab references to the currently loaded modules so that we can
+  -- see if they leak.
+  let !dflags = hsc_dflags hsc_env
+  leak_indicators <- if gopt Opt_GhciLeakCheck dflags
+    then liftIO $ getLeakIndicators hsc_env
+    else return (panic "no leak indicators")
+
   -- unload first
   _ <- GHC.abandonAll
   lift discardActiveBreakPoints
@@ -1653,7 +1700,10 @@ loadModule' files = do
   _ <- GHC.load LoadAllTargets
 
   GHC.setTargets targets
-  doLoadAndCollectInfo False LoadAllTargets
+  success <- doLoadAndCollectInfo False LoadAllTargets
+  when (gopt Opt_GhciLeakCheck dflags) $
+    liftIO $ checkLeakIndicators dflags leak_indicators
+  return success
 
 -- | @:add@ command
 addModule :: [FilePath] -> InputT GHCi ()
@@ -2559,7 +2609,9 @@ showDynFlags show_all dflags = do
                 is_on = test f dflags
                 quiet = not show_all && test f default_dflags == is_on
 
-        default_dflags = defaultDynFlags (settings dflags) (llvmTargets dflags)
+        llvmConfig = (llvmTargets dflags, llvmPasses dflags)
+
+        default_dflags = defaultDynFlags (settings dflags) llvmConfig
 
         (ghciFlags,others)  = partition (\f -> flagSpecFlag f `elem` flgs)
                                         DynFlags.fFlags
@@ -2970,8 +3022,10 @@ showLanguages' show_all dflags =
                 is_on = test f dflags
                 quiet = not show_all && test f default_dflags == is_on
 
+   llvmConfig = (llvmTargets dflags, llvmPasses dflags)
+
    default_dflags =
-       defaultDynFlags (settings dflags) (llvmTargets dflags) `lang_set`
+       defaultDynFlags (settings dflags) llvmConfig `lang_set`
          case language dflags of
            Nothing -> Just Haskell2010
            other   -> other

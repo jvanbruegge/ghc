@@ -4,12 +4,12 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE Trustworthy #-}
-{-# LANGUAGE TypeInType #-}
 {-# LANGUAGE TypeOperators #-}
 
 -----------------------------------------------------------------------------
@@ -126,7 +126,6 @@ import Data.Version( Version(..) )
 import GHC.Base hiding (Any, IntRep, FloatRep)
 import GHC.List
 import GHC.Num
-import GHC.Natural
 import GHC.Read
 import GHC.Show
 import Text.Read( reads )
@@ -1283,6 +1282,9 @@ deriving instance Data a => Data (Last a)
 -- | @since 4.8.0.0
 deriving instance (Data (f a), Data a, Typeable f) => Data (Alt f a)
 
+-- | @since 4.12.0.0
+deriving instance (Data (f a), Data a, Typeable f) => Data (Ap f a)
+
 ----------------------------------------------------------------------------
 -- Data instances for GHC.Generics representations
 
@@ -1307,7 +1309,7 @@ deriving instance (Typeable f, Typeable g, Data p, Data (f p), Data (g p))
     => Data ((f :+: g) p)
 
 -- | @since 4.9.0.0
-deriving instance (Typeable (f :: * -> *), Typeable (g :: * -> *),
+deriving instance (Typeable (f :: Type -> Type), Typeable (g :: Type -> Type),
           Data p, Data (f (g p)))
     => Data ((f :.: g) p)
 
@@ -1332,3 +1334,9 @@ deriving instance Data SourceStrictness
 
 -- | @since 4.9.0.0
 deriving instance Data DecidedStrictness
+
+----------------------------------------------------------------------------
+-- Data instances for Data.Ord
+
+-- | @since 4.12.0.0
+deriving instance Data a => Data (Down a)

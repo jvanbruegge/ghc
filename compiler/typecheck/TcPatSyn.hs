@@ -9,8 +9,8 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TypeFamilies #-}
 
-module TcPatSyn ( tcInferPatSynDecl, tcCheckPatSynDecl
-                , tcPatSynBuilderBind, tcPatSynBuilderOcc, nonBidirectionalErr
+module TcPatSyn ( tcPatSynDecl, tcPatSynBuilderBind
+                , tcPatSynBuilderOcc, nonBidirectionalErr
   ) where
 
 import GhcPrelude
@@ -53,7 +53,7 @@ import FieldLabel
 import Bag
 import Util
 import ErrUtils
-import Control.Monad ( zipWithM )
+import Control.Monad ( zipWithM, when )
 import Data.List( partition )
 
 #include "HsVersions.h"
@@ -66,6 +66,58 @@ import Data.List( partition )
 ************************************************************************
 -}
 
+tcPatSynDecl :: PatSynBind GhcRn GhcRn
+             -> Maybe TcSigInfo
+             -> TcM (LHsBinds GhcTc, TcGblEnv)
+tcPatSynDecl psb@(PSB { psb_id = L _ name, psb_args = details }) mb_sig
+  = recoverM recover $
+    case mb_sig of
+      Nothing                 -> tcInferPatSynDecl psb
+      Just (TcPatSynSig tpsi) -> tcCheckPatSynDecl psb tpsi
+      _ -> panic "tcPatSynDecl"
+
+  where
+    -- See Note [Pattern synonym error recovery]
+    recover = do { matcher_name <- newImplicitBinder name mkMatcherOcc
+                 ; let placeholder = AConLike $ PatSynCon $
+                                     mk_placeholder matcher_name
+                 ; gbl_env <- tcExtendGlobalEnv [placeholder] getGblEnv
+                 ; return (emptyBag, gbl_env) }
+
+    (_arg_names, _rec_fields, is_infix) = collectPatSynArgInfo details
+    mk_placeholder matcher_name
+      = mkPatSyn name is_infix
+                        ([mkTyVarBinder Specified alphaTyVar], []) ([], [])
+                        [] -- Arg tys
+                        alphaTy
+                        (matcher_id, True) Nothing
+                        []  -- Field labels
+       where
+         -- The matcher_id is used only by the desugarer, so actually
+         -- and error-thunk would probably do just as well here.
+         matcher_id = mkLocalId matcher_name $
+                      mkSpecForAllTys [alphaTyVar] alphaTy
+
+tcPatSynDecl (XPatSynBind {}) _ = panic "tcPatSynDecl"
+
+{- Note [Pattern synonym error recovery]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+If type inference for a pattern synonym fails , we can't continue with
+the rest of tc_patsyn_finish, because we may get knock-on errors, or
+even a crash.  E.g. from
+   pattern What = True :: Maybe
+we get a kind error; and we must stop right away (Trac #15289).
+Hence the 'when insoluble failM' in tcInferPatSyn.
+
+But does that abort compilation entirely?  No -- we can recover
+and carry on, just as we do for value bindings, provided we plug in
+placeholder for the pattern synonym.  The goal of the placeholder
+is not to cause a raft of follow-on errors.  I've used the simplest
+thing for now, but we might need to elaborate it a bit later.  (e.g.
+I've given it zero args, which may cause knock-on errors if it is
+used in a pattern.) But it'll do for now.
+-}
+
 tcInferPatSynDecl :: PatSynBind GhcRn GhcRn
                   -> TcM (LHsBinds GhcTc, TcGblEnv)
 tcInferPatSynDecl PSB{ psb_id = lname@(L _ name), psb_args = details,
@@ -76,14 +128,19 @@ tcInferPatSynDecl PSB{ psb_id = lname@(L _ name), psb_args = details,
        ; let (arg_names, rec_fields, is_infix) = collectPatSynArgInfo details
        ; (tclvl, wanted, ((lpat', args), pat_ty))
             <- pushLevelAndCaptureConstraints  $
-               tcInferNoInst $ \ exp_ty ->
-               tcPat PatSyn lpat exp_ty $
+               tcInferNoInst                   $ \ exp_ty ->
+               tcPat PatSyn lpat exp_ty        $
                mapM tcLookupId arg_names
 
        ; let named_taus = (name, pat_ty) : map (\arg -> (getName arg, varType arg)) args
 
-       ; (qtvs, req_dicts, ev_binds, _) <- simplifyInfer tclvl NoRestrictions []
-                                                         named_taus wanted
+       ; (qtvs, req_dicts, ev_binds, insoluble)
+               <- simplifyInfer tclvl NoRestrictions [] named_taus wanted
+
+       ; when insoluble failM
+              -- simplifyInfer doesn't fail if there are errors.  But to avoid
+              -- knock-on errors, or even crashes, we want to stop here.
+              -- See Note [Pattern synonym error recovery]
 
        ; let (ex_tvs, prov_dicts) = tcCollectEx lpat'
              ex_tv_set  = mkVarSet ex_tvs
@@ -116,7 +173,8 @@ tcInferPatSynDecl PSB{ psb_id = lname@(L _ name), psb_args = details,
                           (mkTyVarBinders Inferred univ_tvs
                             , req_theta,  ev_binds, req_dicts)
                           (mkTyVarBinders Inferred ex_tvs
-                            , mkTyVarTys ex_tvs, prov_theta, map evId filtered_prov_dicts)
+                            , mkTyVarTys ex_tvs, prov_theta
+                            , map (EvExpr . evId) filtered_prov_dicts)
                           (map nlHsVar args, map idType args)
                           pat_ty rec_fields }
 tcInferPatSynDecl (XPatSynBind _) = panic "tcInferPatSynDecl"
@@ -202,7 +260,7 @@ and it not straightforward to implement, because by the time we see
 the problem, simplifyInfer has already skolemised 's'.)
 
 This stuff can only happen in the presence of view patterns, with
-TypeInType, so it's a bit of a corner case.
+PolyKinds, so it's a bit of a corner case.
 
 Note [Coercions that escape]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -539,7 +597,7 @@ tc_patsyn_finish :: Located Name      -- ^ PatSyn Name
                  -> Bool              -- ^ Whether infix
                  -> LPat GhcTc        -- ^ Pattern of the PatSyn
                  -> ([TcTyVarBinder], [PredType], TcEvBinds, [EvVar])
-                 -> ([TcTyVarBinder], [TcType], [PredType], [EvExpr])
+                 -> ([TcTyVarBinder], [TcType], [PredType], [EvTerm])
                  -> ([LHsExpr GhcTcId], [TcType])   -- ^ Pattern arguments and
                                                     -- types
                  -> TcType            -- ^ Pattern type
@@ -625,7 +683,7 @@ tc_patsyn_finish lname dir is_infix lpat'
 tcPatSynMatcher :: Located Name
                 -> LPat GhcTc
                 -> ([TcTyVar], ThetaType, TcEvBinds, [EvVar])
-                -> ([TcTyVar], [TcType], ThetaType, [EvExpr])
+                -> ([TcTyVar], [TcType], ThetaType, [EvTerm])
                 -> ([LHsExpr GhcTcId], [TcType])
                 -> TcType
                 -> TcM ((Id, Bool), LHsBinds GhcTc)
@@ -636,9 +694,9 @@ tcPatSynMatcher (L loc name) lpat
                 (args, arg_tys) pat_ty
   = do { rr_name <- newNameAt (mkTyVarOcc "rep") loc
        ; tv_name <- newNameAt (mkTyVarOcc "r")   loc
-       ; let rr_tv  = mkTcTyVar rr_name runtimeRepTy vanillaSkolemTv
+       ; let rr_tv  = mkTyVar rr_name runtimeRepTy
              rr     = mkTyVarTy rr_tv
-             res_tv = mkTcTyVar tv_name (tYPE rr) vanillaSkolemTv
+             res_tv = mkTyVar tv_name (tYPE rr)
              res_ty = mkTyVarTy res_tv
              is_unlifted = null args && null prov_dicts
              (cont_args, cont_arg_tys)
@@ -674,26 +732,23 @@ tcPatSynMatcher (L loc name) lpat
                     L (getLoc lpat) $
                     HsCase noExt (nlHsVar scrutinee) $
                     MG{ mg_alts = L (getLoc lpat) cases
-                      , mg_arg_tys = [pat_ty]
-                      , mg_res_ty = res_ty
+                      , mg_ext = MatchGroupTc [pat_ty] res_ty
                       , mg_origin = Generated
                       }
              body' = noLoc $
                      HsLam noExt $
                      MG{ mg_alts = noLoc [mkSimpleMatch LambdaExpr
                                                         args body]
-                       , mg_arg_tys = [pat_ty, cont_ty, fail_ty]
-                       , mg_res_ty = res_ty
+                       , mg_ext = MatchGroupTc [pat_ty, cont_ty, fail_ty] res_ty
                        , mg_origin = Generated
                        }
              match = mkMatch (mkPrefixFunRhs (L loc name)) []
                              (mkHsLams (rr_tv:res_tv:univ_tvs)
-                             req_dicts body')
+                                       req_dicts body')
                              (noLoc (EmptyLocalBinds noExt))
              mg :: MatchGroup GhcTc (LHsExpr GhcTc)
              mg = MG{ mg_alts = L (getLoc match) [match]
-                    , mg_arg_tys = []
-                    , mg_res_ty = res_ty
+                    , mg_ext = MatchGroupTc [] res_ty
                     , mg_origin = Generated
                     }
 
@@ -711,12 +766,10 @@ tcPatSynMatcher (L loc name) lpat
 
 mkPatSynRecSelBinds :: PatSyn
                     -> [FieldLabel]  -- ^ Visible field labels
-                    -> HsValBinds GhcRn
+                    -> [(Id, LHsBind GhcRn)]
 mkPatSynRecSelBinds ps fields
-  = XValBindsLR (NValBinds selector_binds sigs)
-  where
-    (sigs, selector_binds) = unzip (map mkRecSel fields)
-    mkRecSel fld_lbl = mkOneRecordSelector [PatSynCon ps] (RecSelPatSyn ps) fld_lbl
+  = [ mkOneRecordSelector [PatSynCon ps] (RecSelPatSyn ps) fld_lbl
+    | fld_lbl <- fields ]
 
 isUnidirectional :: HsPatSynDir a -> Bool
 isUnidirectional Unidirectional          = True
@@ -776,10 +829,15 @@ tcPatSynBuilderBind (PSB { psb_id = L loc name, psb_def = lpat
 
   | Right match_group <- mb_match_group  -- Bidirectional
   = do { patsyn <- tcLookupPatSyn name
-       ; let Just (builder_id, need_dummy_arg) = patSynBuilder patsyn
-                   -- Bidirectional, so patSynBuilder returns Just
+       ; case patSynBuilder patsyn of {
+           Nothing -> return emptyBag ;
+             -- This case happens if we found a type error in the
+             -- pattern synonym, recovered, and put a placeholder
+             -- with patSynBuilder=Nothing in the environment
 
-             match_group' | need_dummy_arg = add_dummy_arg match_group
+           Just (builder_id, need_dummy_arg) ->  -- Normal case
+    do { -- Bidirectional, so patSynBuilder returns Just
+         let match_group' | need_dummy_arg = add_dummy_arg match_group
                           | otherwise      = match_group
 
              bind = FunBind { fun_ext = placeHolderNamesTc
@@ -794,7 +852,7 @@ tcPatSynBuilderBind (PSB { psb_id = L loc name, psb_def = lpat
          ppr patsyn $$ ppr builder_id <+> dcolon <+> ppr (idType builder_id)
        ; (builder_binds, _) <- tcPolyCheck emptyPragEnv sig (noLoc bind)
        ; traceTc "tcPatSynBuilderBind }" $ ppr builder_binds
-       ; return builder_binds }
+       ; return builder_binds } } }
 
   | otherwise = panic "tcPatSynBuilderBind"  -- Both cases dealt with
   where
@@ -896,9 +954,7 @@ tcPatToExpr name args pat = go pat
         | otherwise
         = Left (quotes (ppr var) <+> text "is not bound by the LHS of the pattern synonym")
     go1 (ParPat _ pat)          = fmap (HsPar noExt) $ go pat
-    go1 (PArrPat _ pats)        = do { exprs <- mapM go pats
-                                     ; return $ ExplicitPArr noExt exprs }
-    go1 p@(ListPat _ pats _ty reb)
+    go1 p@(ListPat reb pats)
       | Nothing <- reb = do { exprs <- mapM go pats
                             ; return $ ExplicitList noExt Nothing exprs }
       | otherwise                   = notInvertibleListPat p
@@ -1064,10 +1120,9 @@ tcCollectEx pat = go pat
     go1 (AsPat _ _ p)      = go p
     go1 (ParPat _ p)       = go p
     go1 (BangPat _ p)      = go p
-    go1 (ListPat _ ps _ _) = mergeMany . map go $ ps
+    go1 (ListPat _ ps)     = mergeMany . map go $ ps
     go1 (TuplePat _ ps _)  = mergeMany . map go $ ps
     go1 (SumPat _ p _ _)   = go p
-    go1 (PArrPat _ ps)     = mergeMany . map go $ ps
     go1 (ViewPat _ _ p)    = go p
     go1 con@ConPatOut{}    = merge (pat_tvs con, pat_dicts con) $
                               goConDetails $ pat_args con

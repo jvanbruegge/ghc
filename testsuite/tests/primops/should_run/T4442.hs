@@ -8,6 +8,10 @@ import GHC.Stable(
   StablePtr(..), castStablePtrToPtr, castPtrToStablePtr, newStablePtr)
 import GHC.Exts
 import Data.Char(ord)
+#if WORD_SIZE_IN_BITS < 64
+import GHC.Int (Int64(..))
+import GHC.Word (Word64(..))
+#endif
 
 assertEqual :: (Show a, Eq a) => a -> a -> IO ()
 assertEqual a b
@@ -111,6 +115,34 @@ testIntArray name0 index read write val0 len = do
     (intToBytes val len)
     len
 
+#if WORD_SIZE_IN_BITS == 64
+testInt64Array = testIntArray
+#else
+testInt64Array ::
+     String
+  -> (ByteArray# -> Int# -> Int64#)
+  -> (MutableByteArray# RealWorld -> Int# -> State# RealWorld
+        -> (# State# RealWorld, Int64# #))
+  -> (MutableByteArray# RealWorld -> Int# -> Int64# -> State# RealWorld
+        -> State# RealWorld)
+  -> Int64
+  -> Int
+  -> IO ()
+testInt64Array name0 index read write val0 len = do
+  doOne (name0 ++ " positive") val0
+  doOne (name0 ++ " negative") (negate val0)
+ where
+  doOne :: String -> Int64 -> IO ()
+  doOne name val = test
+    name
+    (\arr i -> I64# (index arr i))
+    (\arr i s -> case read arr i s of (# s', a #) -> (# s', I64# a #))
+    (\arr i (I64# a) s -> write arr i a s)
+    val
+    (intToBytes (fromIntegral val) len)
+    len
+#endif
+
 testWordArray ::
      String
   -> (ByteArray# -> Int# -> Word#)
@@ -129,6 +161,29 @@ testWordArray name index read write val len = test
   val
   (intToBytes (fromIntegral val) len)
   len
+
+#if WORD_SIZE_IN_BITS == 64
+testWord64Array = testWordArray
+#else
+testWord64Array ::
+     String
+  -> (ByteArray# -> Int# -> Word64#)
+  -> (MutableByteArray# RealWorld -> Int# -> State# RealWorld
+        -> (# State# RealWorld, Word64# #))
+  -> (MutableByteArray# RealWorld -> Int# -> Word64# -> State# RealWorld
+        -> State# RealWorld)
+  -> Word64
+  -> Int
+  -> IO ()
+testWord64Array name index read write val len = test
+  name
+  (\arr i -> W64# (index arr i))
+  (\arr i s -> case read arr i s of (# s', a #) -> (# s', W64# a #))
+  (\arr i (W64# a) s -> write arr i a s)
+  val
+  (intToBytes (fromIntegral val) len)
+  len
+#endif
 
 wordSizeInBytes :: Int
 wordSizeInBytes = WORD_SIZE_IN_BITS `div` 8
@@ -172,7 +227,7 @@ main = do
   testIntArray "Int32#"
     indexWord8ArrayAsInt32# readWord8ArrayAsInt32# writeWord8ArrayAsInt32#
     12345678 4
-  testIntArray "Int64#"
+  testInt64Array "Int64#"
     indexWord8ArrayAsInt64# readWord8ArrayAsInt64# writeWord8ArrayAsInt64#
     1234567890123 8
   testIntArray "Int#"
@@ -188,7 +243,7 @@ main = do
   testWordArray "Word32#"
     indexWord8ArrayAsWord32# readWord8ArrayAsWord32# writeWord8ArrayAsWord32#
     12345678 4
-  testWordArray "Word64#"
+  testWord64Array "Word64#"
     indexWord8ArrayAsWord64# readWord8ArrayAsWord64# writeWord8ArrayAsWord64#
     1234567890123 8
   testWordArray "Word#"

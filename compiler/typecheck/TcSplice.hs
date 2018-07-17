@@ -103,7 +103,7 @@ import ErrUtils
 import Util
 import Unique
 import VarSet
-import Data.List        ( find, mapAccumL )
+import Data.List        ( find )
 import Data.Maybe
 import FastString
 import BasicTypes hiding( SuccessFlag(..) )
@@ -112,6 +112,7 @@ import DynFlags
 import Panic
 import Lexeme
 import qualified EnumSet
+import Plugins
 
 import qualified Language.Haskell.TH as TH
 -- THSyntax gives access to internal functions and data types
@@ -735,10 +736,13 @@ runMeta' show_code ppr_hs run_and_convert expr
         -- in type-correct programs.
         ; failIfErrsM
 
-        -- Desugar
-        ; ds_expr <- initDsTc (dsLExpr expr)
-        -- Compile and link it; might fail if linking fails
+        -- run plugins
         ; hsc_env <- getTopEnv
+        ; expr' <- withPlugins (hsc_dflags hsc_env) spliceRunAction expr
+
+        -- Desugar
+        ; ds_expr <- initDsTc (dsLExpr expr')
+        -- Compile and link it; might fail if linking fails
         ; src_span <- getSrcSpanM
         ; traceTc "About to run (desugared)" (ppr ds_expr)
         ; either_hval <- tryM $ liftIO $
@@ -898,13 +902,13 @@ instance TH.Quasi TcM where
       updTcRef th_topdecls_var (\topds -> ds ++ topds)
     where
       checkTopDecl :: HsDecl GhcPs -> TcM ()
-      checkTopDecl (ValD binds)
+      checkTopDecl (ValD _ binds)
         = mapM_ bindName (collectHsBindBinders binds)
-      checkTopDecl (SigD _)
+      checkTopDecl (SigD _ _)
         = return ()
-      checkTopDecl (AnnD _)
+      checkTopDecl (AnnD _ _)
         = return ()
-      checkTopDecl (ForD (ForeignImport { fd_name = L _ name }))
+      checkTopDecl (ForD _ (ForeignImport { fd_name = L _ name }))
         = bindName name
       checkTopDecl _
         = addErr $ text "Only function, value, annotation, and foreign import declarations may be added with addTopDecl"
@@ -1491,8 +1495,7 @@ reifyDataCon isGadtDataCon tys dc
               -- See Note [Freshen reified GADT constructors' universal tyvars]
            <- freshenTyVarBndrs $
               filterOut (`elemVarSet` eq_spec_tvs) g_univ_tvs
-       ; let (tvb_subst, g_user_tvs)
-                       = mapAccumL substTyVarBndr univ_subst g_user_tvs'
+       ; let (tvb_subst, g_user_tvs) = substTyVarBndrs univ_subst g_user_tvs'
              g_theta   = substTys tvb_subst g_theta'
              g_arg_tys = substTys tvb_subst g_arg_tys'
              g_res_ty  = substTy  tvb_subst g_res_ty'
@@ -1716,8 +1719,8 @@ reifyFamilyInstance is_poly_tvs inst@(FamInst { fi_flavor = flavor
 ------------------------------
 reifyType :: TyCoRep.Type -> TcM TH.Type
 -- Monadic only because of failure
-reifyType ty                | tcIsStarKind ty = return TH.StarT
-  -- Make sure to use tcIsStarKind here, since we don't want to confuse it
+reifyType ty                | tcIsLiftedTypeKind ty = return TH.StarT
+  -- Make sure to use tcIsLiftedTypeKind here, since we don't want to confuse it
   -- with Constraint (#14869).
 reifyType ty@(ForAllTy {})  = reify_for_all ty
 reifyType (LitTy t)         = do { r <- reifyTyLit t; return (TH.LitT r) }

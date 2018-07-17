@@ -253,8 +253,8 @@ cmmRegOff reg byte_off = CmmRegOff reg byte_off
 cmmOffsetLit :: CmmLit -> Int -> CmmLit
 cmmOffsetLit (CmmLabel l)      byte_off = cmmLabelOff l byte_off
 cmmOffsetLit (CmmLabelOff l m) byte_off = cmmLabelOff l (m+byte_off)
-cmmOffsetLit (CmmLabelDiffOff l1 l2 m) byte_off
-                                        = CmmLabelDiffOff l1 l2 (m+byte_off)
+cmmOffsetLit (CmmLabelDiffOff l1 l2 m w) byte_off
+                                        = CmmLabelDiffOff l1 l2 (m+byte_off) w
 cmmOffsetLit (CmmInt m rep)    byte_off = CmmInt (m + fromIntegral byte_off) rep
 cmmOffsetLit _                 byte_off = pprPanic "cmmOffsetLit" (ppr byte_off)
 
@@ -456,20 +456,17 @@ regUsedIn dflags = regUsedIn_ where
 --
 ---------------------------------------------
 
-mkLiveness :: DynFlags -> [Maybe LocalReg] -> Liveness
+mkLiveness :: DynFlags -> [LocalReg] -> Liveness
 mkLiveness _      [] = []
 mkLiveness dflags (reg:regs)
-  = take sizeW bits ++ mkLiveness dflags regs
+  = bits ++ mkLiveness dflags regs
   where
-    sizeW = case reg of
-              Nothing -> 1
-              Just r -> (widthInBytes (typeWidth (localRegType r)) + wORD_SIZE dflags - 1)
-                        `quot` wORD_SIZE dflags
-                        -- number of words, rounded up
-    bits = repeat $ is_non_ptr reg -- True <=> Non Ptr
+    sizeW = (widthInBytes (typeWidth (localRegType reg)) + wORD_SIZE dflags - 1)
+            `quot` wORD_SIZE dflags
+            -- number of words, rounded up
+    bits = replicate sizeW is_non_ptr -- True <=> Non Ptr
 
-    is_non_ptr Nothing    = True
-    is_non_ptr (Just reg) = not $ isGcPtrType (localRegType reg)
+    is_non_ptr = not $ isGcPtrType (localRegType reg)
 
 
 -- ============================================== -

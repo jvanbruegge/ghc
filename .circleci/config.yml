@@ -1,3 +1,6 @@
+# Questions about this file?
+# See https://ghc.haskell.org/trac/ghc/wiki/ContinuousIntegration/Usage.
+
 version: 2
 
 aliases:
@@ -12,7 +15,9 @@ aliases:
       name: submodules
       command: .circleci/fetch-submodules.sh
   - &buildenv
-    THREADS: 9
+    # ideally we would simply set THREADS here instead of re-detecting it every
+    # time we need it below. Unfortunately, there is no way to set an environment
+    # variable with the result of a shell script.
     SKIP_PERF_TESTS: YES
     VERBOSE: 2
   - &boot
@@ -35,7 +40,7 @@ aliases:
     run:
       name: Configure
       command: |
-        setarch i386 ./configure --with-ghc=/opt/ghc-i386/8.2.2/bin/ghc
+        setarch i386 ./configure --with-ghc=/opt/ghc-i386/8.4.2/bin/ghc
   - &configure_bsd
     run:
       name: Configure
@@ -47,17 +52,22 @@ aliases:
   - &make
     run:
       name: Build
-      command: "make -j$THREADS"
+      command: "make -j`mk/detect-cpu-count.sh`"
   - &build_hadrian
     run:
       name: Build GHC using Hadrian
       command: |
         cabal update
-        hadrian/build.sh -j$THREADS
+        hadrian/build.sh -j`mk/detect-cpu-count.sh`
   - &test
     run:
       name: Test
-      command: make test SKIP_PERF_TESTS=YES
+      command: |
+        mkdir -p test-results
+        make test THREADS=`mk/detect-cpu-count.sh` SKIP_PERF_TESTS=YES JUNIT_FILE=../../test-results/junit.xml
+  - &store_test_results
+    store_test_results:
+      path: test-results
   - &slowtest
     run:
       name: Full Test
@@ -85,7 +95,7 @@ jobs:
   "validate-x86_64-linux":
     resource_class: xlarge
     docker:
-      - image: ghcci/x86_64-linux:0.0.1
+      - image: ghcci/x86_64-linux:0.0.2
     environment:
       <<: *buildenv
       GHC_COLLECTOR_FLAVOR: x86_64-linux
@@ -99,6 +109,7 @@ jobs:
       - *bindist
       - *storeartifacts
       - *test
+      - *store_test_results
 
   "validate-x86_64-freebsd":
     resource_class: xlarge
@@ -118,6 +129,7 @@ jobs:
       - *bindist
       - *storeartifacts
       - *test
+      - *store_test_results
 
   "validate-x86_64-darwin":
     macos:
@@ -139,11 +151,12 @@ jobs:
       - *bindist
       - *storeartifacts
       - *test
+      - *store_test_results
 
   "validate-hadrian-x86_64-linux":
     resource_class: xlarge
     docker:
-      - image: ghcci/x86_64-linux:0.0.1
+      - image: ghcci/x86_64-linux:0.0.2
     environment:
       <<: *buildenv
     steps:
@@ -157,7 +170,7 @@ jobs:
   "validate-x86_64-linux-unreg":
     resource_class: xlarge
     docker:
-      - image: ghcci/x86_64-linux:0.0.1
+      - image: ghcci/x86_64-linux:0.0.2
     environment:
       <<: *buildenv
     steps:
@@ -168,11 +181,12 @@ jobs:
       - *configure_unreg
       - *make
       - *test
+      - *store_test_results
 
   "validate-x86_64-linux-llvm":
     resource_class: xlarge
     docker:
-      - image: ghcci/x86_64-linux:0.0.1
+      - image: ghcci/x86_64-linux:0.0.2
     environment:
       <<: *buildenv
       BUILD_FLAVOUR: perf-llvm
@@ -180,8 +194,8 @@ jobs:
       - run:
           name: Install LLVM
           command: |
-            curl http://releases.llvm.org/5.0.0/clang+llvm-5.0.0-x86_64-linux-gnu-debian8.tar.xz | tar -xJC ..
-            echo "export PATH=`pwd`/../clang+llvm-5.0.0-x86_64-linux-gnu-debian8/bin:\$PATH" >> $BASH_ENV
+            curl http://releases.llvm.org/6.0.0/clang+llvm-6.0.0-x86_64-linux-gnu-debian8.tar.xz | tar -xJC ..
+            echo "export PATH=`pwd`/../clang+llvm-6.0.0-x86_64-linux-gnu-debian8/bin:\$PATH" >> $BASH_ENV
       - run:
           name: Verify that llc works
           command: llc
@@ -197,7 +211,7 @@ jobs:
   "validate-x86_64-linux-debug":
     resource_class: xlarge
     docker:
-      - image: ghcci/x86_64-linux:0.0.1
+      - image: ghcci/x86_64-linux:0.0.2
     environment:
       BUILD_FLAVOUR: devel2
       <<: *buildenv
@@ -209,11 +223,12 @@ jobs:
       - *configure_unreg
       - *make
       - *test
+      - *store_test_results
 
   "validate-i386-linux":
     resource_class: xlarge
     docker:
-      - image: ghcci/i386-linux:0.0.1
+      - image: ghcci/i386-linux:0.0.2
     environment:
       <<: *buildenv
       GHC_COLLECTOR_FLAVOR: i386-linux
@@ -227,11 +242,12 @@ jobs:
       - *bindist
       - *storeartifacts
       - *test
+      - *store_test_results
 
   "validate-x86_64-fedora":
     resource_class: xlarge
     docker:
-      - image: ghcci/x86_64-linux-fedora:0.0.2
+      - image: ghcci/x86_64-linux-fedora:0.0.4
     environment:
       <<: *buildenv
       GHC_COLLECTOR_FLAVOR: x86_64-fedora
@@ -245,6 +261,23 @@ jobs:
       - *bindist
       - *storeartifacts
       - *test
+      - *store_test_results
+
+  "slow-validate-x86_64-linux":
+    resource_class: xlarge
+    docker:
+      - image: ghcci/x86_64-linux:0.0.2
+    environment:
+      <<: *buildenv
+      GHC_COLLECTOR_FLAVOR: x86_64-linux
+    steps:
+      - checkout
+      - *prepare
+      - *submodules
+      - *boot
+      - *configure_unix
+      - *make
+      - *slowtest
 
 workflows:
   version: 2
@@ -275,6 +308,7 @@ workflows:
     - validate-x86_64-linux-unreg
     - validate-x86_64-linux-llvm
     - validate-x86_64-linux-debug
+    - slow-validate-x86_64-linux
 
 notify:
   webhooks:

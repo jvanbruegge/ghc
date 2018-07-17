@@ -194,7 +194,7 @@ shouldInlinePrimOp _ CopyMutableArrayArrayOp
 
 shouldInlinePrimOp dflags CloneArrayOp [src, src_off, (CmmLit (CmmInt n w))]
   | wordsToBytes dflags (asUnsigned w n) <= fromIntegral (maxInlineAllocSize dflags) =
-      Just $ \ [res] -> emitCloneArray mkMAP_FROZEN_infoLabel res src src_off (fromInteger n)
+      Just $ \ [res] -> emitCloneArray mkMAP_FROZEN_CLEAN_infoLabel res src src_off (fromInteger n)
 
 shouldInlinePrimOp dflags CloneMutableArrayOp [src, src_off, (CmmLit (CmmInt n w))]
   | wordsToBytes dflags (asUnsigned w n) <= fromIntegral (maxInlineAllocSize dflags) =
@@ -202,7 +202,7 @@ shouldInlinePrimOp dflags CloneMutableArrayOp [src, src_off, (CmmLit (CmmInt n w
 
 shouldInlinePrimOp dflags FreezeArrayOp [src, src_off, (CmmLit (CmmInt n w))]
   | wordsToBytes dflags (asUnsigned w n) <= fromIntegral (maxInlineAllocSize dflags) =
-      Just $ \ [res] -> emitCloneArray mkMAP_FROZEN_infoLabel res src src_off (fromInteger n)
+      Just $ \ [res] -> emitCloneArray mkMAP_FROZEN_CLEAN_infoLabel res src src_off (fromInteger n)
 
 shouldInlinePrimOp dflags ThawArrayOp [src, src_off, (CmmLit (CmmInt n w))]
   | wordsToBytes dflags (asUnsigned w n) <= fromIntegral (maxInlineAllocSize dflags) =
@@ -227,7 +227,7 @@ shouldInlinePrimOp _ CopySmallMutableArrayOp
 
 shouldInlinePrimOp dflags CloneSmallArrayOp [src, src_off, (CmmLit (CmmInt n w))]
   | wordsToBytes dflags (asUnsigned w n) <= fromIntegral (maxInlineAllocSize dflags) =
-      Just $ \ [res] -> emitCloneSmallArray mkSMAP_FROZEN_infoLabel res src src_off (fromInteger n)
+      Just $ \ [res] -> emitCloneSmallArray mkSMAP_FROZEN_CLEAN_infoLabel res src src_off (fromInteger n)
 
 shouldInlinePrimOp dflags CloneSmallMutableArrayOp [src, src_off, (CmmLit (CmmInt n w))]
   | wordsToBytes dflags (asUnsigned w n) <= fromIntegral (maxInlineAllocSize dflags) =
@@ -235,7 +235,7 @@ shouldInlinePrimOp dflags CloneSmallMutableArrayOp [src, src_off, (CmmLit (CmmIn
 
 shouldInlinePrimOp dflags FreezeSmallArrayOp [src, src_off, (CmmLit (CmmInt n w))]
   | wordsToBytes dflags (asUnsigned w n) <= fromIntegral (maxInlineAllocSize dflags) =
-      Just $ \ [res] -> emitCloneSmallArray mkSMAP_FROZEN_infoLabel res src src_off (fromInteger n)
+      Just $ \ [res] -> emitCloneSmallArray mkSMAP_FROZEN_CLEAN_infoLabel res src src_off (fromInteger n)
 
 shouldInlinePrimOp dflags ThawSmallArrayOp [src, src_off, (CmmLit (CmmInt n w))]
   | wordsToBytes dflags (asUnsigned w n) <= fromIntegral (maxInlineAllocSize dflags) =
@@ -383,20 +383,20 @@ emitPrimOp dflags [res] DataToTagOp [arg]
 
 --  #define unsafeFreezzeArrayzh(r,a)
 --      {
---        SET_INFO((StgClosure *)a,&stg_MUT_ARR_PTRS_FROZEN0_info);
+--        SET_INFO((StgClosure *)a,&stg_MUT_ARR_PTRS_FROZEN_DIRTY_info);
 --        r = a;
 --      }
 emitPrimOp _      [res] UnsafeFreezeArrayOp [arg]
    = emit $ catAGraphs
-   [ setInfo arg (CmmLit (CmmLabel mkMAP_FROZEN0_infoLabel)),
+   [ setInfo arg (CmmLit (CmmLabel mkMAP_FROZEN_DIRTY_infoLabel)),
      mkAssign (CmmLocal res) arg ]
 emitPrimOp _      [res] UnsafeFreezeArrayArrayOp [arg]
    = emit $ catAGraphs
-   [ setInfo arg (CmmLit (CmmLabel mkMAP_FROZEN0_infoLabel)),
+   [ setInfo arg (CmmLit (CmmLabel mkMAP_FROZEN_DIRTY_infoLabel)),
      mkAssign (CmmLocal res) arg ]
 emitPrimOp _      [res] UnsafeFreezeSmallArrayOp [arg]
    = emit $ catAGraphs
-   [ setInfo arg (CmmLit (CmmLabel mkSMAP_FROZEN0_infoLabel)),
+   [ setInfo arg (CmmLit (CmmLabel mkSMAP_FROZEN_DIRTY_infoLabel)),
      mkAssign (CmmLocal res) arg ]
 
 --  #define unsafeFreezzeByteArrayzh(r,a)       r=(a)
@@ -907,6 +907,11 @@ callishPrimOpSupported dflags op
                          || llvm      -> Left (MO_Add2       (wordWidth dflags))
                      | otherwise      -> Right genericWordAdd2Op
 
+      WordAddCOp     | (ncg && (x86ish
+                                || ppc))
+                         || llvm      -> Left (MO_AddWordC   (wordWidth dflags))
+                     | otherwise      -> Right genericWordAddCOp
+
       WordSubCOp     | (ncg && (x86ish
                                 || ppc))
                          || llvm      -> Left (MO_SubWordC   (wordWidth dflags))
@@ -1043,17 +1048,64 @@ genericWordAdd2Op [res_h, res_l] [arg_x, arg_y]
                    (bottomHalf (CmmReg (CmmLocal r1))))]
 genericWordAdd2Op _ _ = panic "genericWordAdd2Op"
 
+-- | Implements branchless recovery of the carry flag @c@ by checking the
+-- leftmost bits of both inputs @a@ and @b@ and result @r = a + b@:
+--
+-- @
+--    c = a&b | (a|b)&~r
+-- @
+--
+-- https://brodowsky.it-sky.net/2015/04/02/how-to-recover-the-carry-bit/
+genericWordAddCOp :: GenericOp
+genericWordAddCOp [res_r, res_c] [aa, bb]
+ = do dflags <- getDynFlags
+      emit $ catAGraphs [
+        mkAssign (CmmLocal res_r) (CmmMachOp (mo_wordAdd dflags) [aa,bb]),
+        mkAssign (CmmLocal res_c) $
+          CmmMachOp (mo_wordUShr dflags) [
+            CmmMachOp (mo_wordOr dflags) [
+              CmmMachOp (mo_wordAnd dflags) [aa,bb],
+              CmmMachOp (mo_wordAnd dflags) [
+                CmmMachOp (mo_wordOr dflags) [aa,bb],
+                CmmMachOp (mo_wordNot dflags) [CmmReg (CmmLocal res_r)]
+              ]
+            ],
+            mkIntExpr dflags (wORD_SIZE_IN_BITS dflags - 1)
+          ]
+        ]
+genericWordAddCOp _ _ = panic "genericWordAddCOp"
+
+-- | Implements branchless recovery of the carry flag @c@ by checking the
+-- leftmost bits of both inputs @a@ and @b@ and result @r = a - b@:
+--
+-- @
+--    c = ~a&b | (~a|b)&r
+-- @
+--
+-- https://brodowsky.it-sky.net/2015/04/02/how-to-recover-the-carry-bit/
 genericWordSubCOp :: GenericOp
-genericWordSubCOp [res_r, res_c] [aa, bb] = do
-  dflags <- getDynFlags
-  emit $ catAGraphs
-    [ -- Put the result into 'res_r'.
-      mkAssign (CmmLocal res_r) $
-        CmmMachOp (mo_wordSub dflags) [aa, bb]
-      -- Set 'res_c' to 1 if 'bb > aa' and to 0 otherwise.
-    , mkAssign (CmmLocal res_c) $
-        CmmMachOp (mo_wordUGt dflags) [bb, aa]
-    ]
+genericWordSubCOp [res_r, res_c] [aa, bb]
+ = do dflags <- getDynFlags
+      emit $ catAGraphs [
+        mkAssign (CmmLocal res_r) (CmmMachOp (mo_wordSub dflags) [aa,bb]),
+        mkAssign (CmmLocal res_c) $
+          CmmMachOp (mo_wordUShr dflags) [
+            CmmMachOp (mo_wordOr dflags) [
+              CmmMachOp (mo_wordAnd dflags) [
+                CmmMachOp (mo_wordNot dflags) [aa],
+                bb
+              ],
+              CmmMachOp (mo_wordAnd dflags) [
+                CmmMachOp (mo_wordOr dflags) [
+                  CmmMachOp (mo_wordNot dflags) [aa],
+                  bb
+                ],
+                CmmReg (CmmLocal res_r)
+              ]
+            ],
+            mkIntExpr dflags (wORD_SIZE_IN_BITS dflags - 1)
+          ]
+        ]
 genericWordSubCOp _ _ = panic "genericWordSubCOp"
 
 genericIntAddCOp :: GenericOp

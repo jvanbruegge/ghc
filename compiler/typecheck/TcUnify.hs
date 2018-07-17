@@ -13,7 +13,8 @@ module TcUnify (
   tcWrapResult, tcWrapResultO, tcSkolemise, tcSkolemiseET,
   tcSubTypeHR, tcSubTypeO, tcSubType_NC, tcSubTypeDS,
   tcSubTypeDS_NC_O, tcSubTypeET,
-  checkConstraints, buildImplicationFor,
+  checkConstraints, checkTvConstraints,
+  buildImplicationFor,
 
   -- Various unifications
   unifyType, unifyTheta, unifyKind,
@@ -24,15 +25,13 @@ module TcUnify (
   -- Holes
   tcInferInst, tcInferNoInst,
   matchExpectedListTy,
-  matchExpectedPArrTy,
   matchExpectedTyConApp,
   matchExpectedAppTy,
   matchExpectedFunTys,
   matchActualFunTys, matchActualFunTysPart,
   matchExpectedFunKind,
 
-  occCheckExpand, metaTyVarUpdateOK,
-  occCheckForErrors, OccCheckResult(..)
+  metaTyVarUpdateOK, occCheckForErrors, OccCheckResult(..)
 
   ) where
 
@@ -61,7 +60,6 @@ import DynFlags
 import BasicTypes
 import Bag
 import Util
-import Pair( pFst )
 import qualified GHC.LanguageExtensions as LangExt
 import Outputable
 
@@ -360,13 +358,6 @@ matchExpectedListTy :: TcRhoType -> TcM (TcCoercionN, TcRhoType)
 matchExpectedListTy exp_ty
  = do { (co, [elt_ty]) <- matchExpectedTyConApp listTyCon exp_ty
       ; return (co, elt_ty) }
-
-----------------------
-matchExpectedPArrTy :: TcRhoType -> TcM (TcCoercionN, TcRhoType)
--- Special case for parrs
-matchExpectedPArrTy exp_ty
-  = do { (co, [elt_ty]) <- matchExpectedTyConApp parrTyCon exp_ty
-       ; return (co, elt_ty) }
 
 ---------------------
 matchExpectedTyConApp :: TyCon                -- T :: forall kv1 ... kvm. k1 -> ... -> kn -> *
@@ -980,7 +971,7 @@ promoteTcType dest_lvl ty
                                           , uo_thing    = Nothing
                                           , uo_visible  = False }
            ; ki_co <- uType KindLevel kind_orig (typeKind ty) res_kind
-           ; let co = mkTcNomReflCo ty `mkTcCoherenceRightCo` ki_co
+           ; let co = mkTcGReflRightCo Nominal ty ki_co
            ; return (co, ty `mkCastTy` ki_co) }
 
 {- Note [Promoting a type]
@@ -1124,29 +1115,45 @@ checkConstraints :: SkolemInfo
                  -> TcM (TcEvBinds, result)
 
 checkConstraints skol_info skol_tvs given thing_inside
-  = do { (implics, ev_binds, result)
-            <- buildImplication skol_info skol_tvs given thing_inside
-       ; emitImplications implics
-       ; return (ev_binds, result) }
-
-buildImplication :: SkolemInfo
-                 -> [TcTyVar]           -- Skolems
-                 -> [EvVar]             -- Given
-                 -> TcM result
-                 -> TcM (Bag Implication, TcEvBinds, result)
-buildImplication skol_info skol_tvs given thing_inside
   = do { implication_needed <- implicationNeeded skol_tvs given
 
        ; if implication_needed
          then do { (tclvl, wanted, result) <- pushLevelAndCaptureConstraints thing_inside
                  ; (implics, ev_binds) <- buildImplicationFor tclvl skol_info skol_tvs given wanted
-                 ; return (implics, ev_binds, result) }
+                 ; traceTc "checkConstraints" (ppr tclvl $$ ppr skol_tvs)
+                 ; emitImplications implics
+                 ; return (ev_binds, result) }
 
          else -- Fast path.  We check every function argument with
               -- tcPolyExpr, which uses tcSkolemise and hence checkConstraints.
               -- So this fast path is well-exercised
               do { res <- thing_inside
-                 ; return (emptyBag, emptyTcEvBinds, res) } }
+                 ; return (emptyTcEvBinds, res) } }
+
+checkTvConstraints :: SkolemInfo
+                   -> Maybe SDoc  -- User-written telescope, if present
+                   -> TcM ([TcTyVar], result)
+                   -> TcM ([TcTyVar], result)
+
+checkTvConstraints skol_info m_telescope thing_inside
+  = do { (tclvl, wanted, (skol_tvs, result))
+             <- pushLevelAndCaptureConstraints thing_inside
+
+       ; if isEmptyWC wanted
+         then return ()
+         else do { tc_lcl_env <- getLclEnv
+                 ; ev_binds   <- newNoTcEvBinds
+                 ; emitImplication $
+                   newImplication { ic_tclvl     = tclvl
+                                  , ic_skols     = skol_tvs
+                                  , ic_no_eqs    = True
+                                  , ic_telescope = m_telescope
+                                  , ic_wanted    = wanted
+                                  , ic_binds     = ev_binds
+                                  , ic_info      = skol_info
+                                  , ic_env       = tc_lcl_env } }
+       ; return (skol_tvs, result) }
+
 
 implicationNeeded :: [TcTyVar] -> [EvVar] -> TcM Bool
 -- With the solver producing unlifted equalities, we need
@@ -1258,7 +1265,7 @@ uType, uType_defer
   -> CtOrigin
   -> TcType    -- ty1 is the *actual* type
   -> TcType    -- ty2 is the *expected* type
-  -> TcM Coercion
+  -> TcM CoercionN
 
 --------------
 -- It is always safe to defer unification to the main constraint solver
@@ -1293,9 +1300,20 @@ uType t_or_k origin orig_ty1 orig_ty2
             else traceTc "u_tys yields coercion:" (ppr co)
        ; return co }
   where
-    go :: TcType -> TcType -> TcM Coercion
+    go :: TcType -> TcType -> TcM CoercionN
         -- The arguments to 'go' are always semantically identical
         -- to orig_ty{1,2} except for looking through type synonyms
+
+     -- Unwrap casts before looking for variables. This way, we can easily
+     -- recognize (t |> co) ~ (t |> co), which is nice. Previously, we
+     -- didn't do it this way, and then the unification above was deferred.
+    go (CastTy t1 co1) t2
+      = do { co_tys <- uType t_or_k origin t1 t2
+           ; return (mkCoherenceLeftCo Nominal t1 co1 co_tys) }
+
+    go t1 (CastTy t2 co2)
+      = do { co_tys <- uType t_or_k origin t1 t2
+           ; return (mkCoherenceRightCo Nominal t2 co2 co_tys) }
 
         -- Variables; go for uVar
         -- Note that we pass in *original* (before synonym expansion),
@@ -1317,15 +1335,7 @@ uType t_or_k origin orig_ty1 orig_ty2
       -- See Note [Expanding synonyms during unification]
     go ty1@(TyConApp tc1 []) (TyConApp tc2 [])
       | tc1 == tc2
-      = return $ mkReflCo Nominal ty1
-
-    go (CastTy t1 co1) t2
-      = do { co_tys <- go t1 t2
-           ; return (mkCoherenceLeftCo co_tys co1) }
-
-    go t1 (CastTy t2 co2)
-      = do { co_tys <- go t1 t2
-           ; return (mkCoherenceRightCo co_tys co2) }
+      = return $ mkNomReflCo ty1
 
         -- See Note [Expanding synonyms during unification]
         --
@@ -1564,19 +1574,25 @@ uUnfilledVar2 origin t_or_k swapped tv1 ty2
       | canSolveByUnification cur_lvl tv1 ty2
       , Just ty2' <- metaTyVarUpdateOK dflags tv1 ty2
       = do { co_k <- uType KindLevel kind_origin (typeKind ty2') (tyVarKind tv1)
+           ; traceTc "uUnfilledVar2 ok" $
+             vcat [ ppr tv1 <+> dcolon <+> ppr (tyVarKind tv1)
+                  , ppr ty2 <+> dcolon <+> ppr (typeKind  ty2)
+                  , ppr (isTcReflCo co_k), ppr co_k ]
+
            ; if isTcReflCo co_k  -- only proceed if the kinds matched.
 
              then do { writeMetaTyVar tv1 ty2'
                      ; return (mkTcNomReflCo ty2') }
-             else defer } -- this cannot be solved now.
-                          -- See Note [Equalities with incompatible kinds]
-                          -- in TcCanonical
+
+             else defer } -- This cannot be solved now.  See TcCanonical
+                          -- Note [Equalities with incompatible kinds]
 
       | otherwise
-      = defer
+      = do { traceTc "uUnfilledVar2 not ok" (ppr tv1 $$ ppr ty2)
                -- Occurs check or an untouchable: just defer
                -- NB: occurs check isn't necessarily fatal:
                --     eg tv1 occured in type family parameter
+            ; defer }
 
     ty1 = mkTyVarTy tv1
     kind_origin = KindEqOrigin ty1 (Just ty2) origin (Just t_or_k)
@@ -1585,72 +1601,113 @@ uUnfilledVar2 origin t_or_k swapped tv1 ty2
 
 swapOverTyVars :: TcTyVar -> TcTyVar -> Bool
 swapOverTyVars tv1 tv2
-  | isFmvTyVar tv1 = False  -- See Note [Fmv Orientation Invariant]
-  | isFmvTyVar tv2 = True
+  -- Level comparison: see Note [TyVar/TyVar orientation]
+  | lvl1 `strictlyDeeperThan` lvl2 = False
+  | lvl2 `strictlyDeeperThan` lvl1 = True
 
-  | Just lvl1 <- metaTyVarTcLevel_maybe tv1
-      -- If tv1 is touchable, swap only if tv2 is also
-      -- touchable and it's strictly better to update the latter
-      -- But see Note [Avoid unnecessary swaps]
-  = case metaTyVarTcLevel_maybe tv2 of
-      Nothing   -> False
-      Just lvl2 | lvl2 `strictlyDeeperThan` lvl1 -> True
-                | lvl1 `strictlyDeeperThan` lvl2 -> False
-                | otherwise                      -> nicer_to_update_tv2
+  -- Priority: see Note [TyVar/TyVar orientation]
+  | pri1 > pri2 = False
+  | pri2 > pri1 = True
 
-  -- So tv1 is not a meta tyvar
-  -- If only one is a meta tyvar, put it on the left
-  -- This is not because it'll be solved; but because
-  -- the floating step looks for meta tyvars on the left
-  | isMetaTyVar tv2 = True
-
-  -- So neither is a meta tyvar (including FlatMetaTv)
-
-  -- If only one is a flatten skolem, put it on the left
-  -- See Note [Eliminate flat-skols]
-  | not (isFlattenTyVar tv1), isFlattenTyVar tv2 = True
+  -- Names: see Note [TyVar/TyVar orientation]
+  | isSystemName tv2_name, not (isSystemName tv1_name) = True
 
   | otherwise = False
 
   where
+    lvl1 = tcTyVarLevel tv1
+    lvl2 = tcTyVarLevel tv2
+    pri1 = lhsPriority tv1
+    pri2 = lhsPriority tv2
     tv1_name = Var.varName tv1
     tv2_name = Var.varName tv2
 
-    nicer_to_update_tv2
-      | isSigTyVar tv1, not (isSigTyVar tv2)               = True
-      | isSystemName tv2_name, not (isSystemName tv1_name) = True
---      | nameUnique tv1_name `ltUnique` nameUnique tv2_name = True
---      -- See Note [Eliminate younger unification variables]
---      (which also explains why it's commented out)
-      | otherwise = False
+
+lhsPriority :: TcTyVar -> Int
+-- Higher => more important to be on the LHS
+-- See Note [TyVar/TyVar orientation]
+lhsPriority tv
+  = ASSERT2( isTyVar tv, ppr tv)
+    case tcTyVarDetails tv of
+      RuntimeUnk  -> 0
+      SkolemTv {} -> 0
+      MetaTv { mtv_info = info } -> case info of
+                                     FlatSkolTv -> 1
+                                     SigTv      -> 2
+                                     TauTv      -> 3
+                                     FlatMetaTv -> 4
+{- Note [TyVar/TyVar orientation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Given (a ~ b), should we orient the CTyEqCan as (a~b) or (b~a)?
+This is a surprisingly tricky question!
+
+First note: only swap if you have to!
+   See Note [Avoid unnecessary swaps]
+
+So we look for a positive reason to swap, using a three-step test:
+
+* Level comparison. If 'a' has deeper level than 'b',
+  put 'a' on the left.  See Note [Deeper level on the left]
+
+* Priority.  If the levels are the same, look at what kind of
+  type variable it is, using 'lhsPriority'
+
+  - FlatMetaTv: Always put on the left.
+    See Note [Fmv Orientation Invariant]
+    NB: FlatMetaTvs always have the current level, never an
+        outer one.  So nothing can be deeper than a FlatMetaTv
 
 
--- @trySpontaneousSolve wi@ solves equalities where one side is a
--- touchable unification variable.
--- Returns True <=> spontaneous solve happened
-canSolveByUnification :: TcLevel -> TcTyVar -> TcType -> Bool
-canSolveByUnification tclvl tv xi
-  | isTouchableMetaTyVar tclvl tv
-  = case metaTyVarInfo tv of
-      SigTv -> is_tyvar xi
-      _     -> True
+  - SigTv/TauTv:  if we have  sig_tv ~ tau_tv, put tau_tv
+                  on the left because there are fewer
+                  restrictions on updating TauTvs
 
-  | otherwise    -- Untouchable
-  = False
-  where
-    is_tyvar xi
-      = case tcGetTyVar_maybe xi of
-          Nothing -> False
-          Just tv -> case tcTyVarDetails tv of
-                       MetaTv { mtv_info = info }
-                                   -> case info of
-                                        SigTv -> True
-                                        _     -> False
-                       SkolemTv {} -> True
-                       RuntimeUnk  -> True
+  - SigTv/TauTv:  put on the left eitehr
+     a) Because it's touchable and can be unified, or
+     b) Even if it's not touchable, TcSimplify.floatEqualities
+        looks for meta tyvars on the left
 
-{- Note [Fmv Orientation Invariant]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  - FlatSkolTv: Put on the left in preference to a SkolemTv
+                See Note [Eliminate flat-skols]
+
+* Names. If the level and priority comparisons are all
+  equal, try to eliminate a TyVars with a System Name in
+  favour of ones with a Name derived from a user type signature
+
+* Age.  At one point in the past we tried to break any remaining
+  ties by eliminating the younger type variable, based on their
+  Uniques.  See Note [Eliminate younger unification variables]
+  (which also explains why we don't do this any more)
+
+Note [Deeper level on the left]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The most important thing is that we want to put tyvars with
+the deepest level on the left.  The reason to do so differs for
+Wanteds and Givens, but either way, deepest wins!  Simple.
+
+* Wanteds.  Putting the deepest variable on the left maximise the
+  chances that it's a touchable meta-tyvar which can be solved.
+
+* Givens. Suppose we have something like
+     forall a[2]. b[1] ~ a[2] => beta[1] ~ a[2]
+
+  If we orient the Given a[2] on the left, we'll rewrite the Wanted to
+  (beta[1] ~ b[1]), and that can float out of the implication.
+  Otherwise it can't.  By putting the deepest variable on the left
+  we maximise our changes of elminating skolem capture.
+
+  See also TcSMonad Note [Let-bound skolems] for another reason
+  to orient with the deepest skolem on the left.
+
+  IMPORTANT NOTE: this test does a level-number comparison on
+  skolems, so it's important that skolems have (accurate) level
+  numbers.
+
+See Trac #15009 for an further analysis of why "deepest on the left"
+is a good plan.
+
+Note [Fmv Orientation Invariant]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    * We always orient a constraint
         fmv ~ alpha
      with fmv on the left, even if alpha is
@@ -1683,11 +1740,29 @@ T10226, T10009.)
           [WD] F fmv ~ fmv, [WD] fmv ~ a
     And now we are stuck.
 
-So instead the Fmv Orientation Invariant puts te fmv on the
+So instead the Fmv Orientation Invariant puts the fmv on the
 left, giving
       [WD] fmv ~ alpha, [WD] F alpha ~ fmv, [WD] alpha ~ a
 
     Now we get alpha:=a, and everything works out
+
+Note [Eliminate flat-skols]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose we have  [G] Num (F [a])
+then we flatten to
+     [G] Num fsk
+     [G] F [a] ~ fsk
+where fsk is a flatten-skolem (FlatSkolTv). Suppose we have
+      type instance F [a] = a
+then we'll reduce the second constraint to
+     [G] a ~ fsk
+and then replace all uses of 'a' with fsk.  That's bad because
+in error messages intead of saying 'a' we'll say (F [a]).  In all
+places, including those where the programmer wrote 'a' in the first
+place.  Very confusing!  See Trac #7862.
+
+Solution: re-orient a~fsk to fsk~a, so that we preferentially eliminate
+the fsk.
 
 Note [Avoid unnecessary swaps]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1706,7 +1781,7 @@ Note [Eliminate younger unification variables]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Given a choice of unifying
      alpha := beta   or   beta := alpha
-we try, if possible, to elimiate the "younger" one, as determined
+we try, if possible, to eliminate the "younger" one, as determined
 by `ltUnique`.  Reason: the younger one is less likely to appear free in
 an existing inert constraint, and hence we are less likely to be forced
 into kicking out and rewriting inert constraints.
@@ -1719,10 +1794,34 @@ But, to my surprise, it didn't seem to make any significant difference
 to the compiler's performance, so I didn't take it any further.  Still
 it seemed to too nice to discard altogether, so I'm leaving these
 notes.  SLPJ Jan 18.
+-}
 
+-- @trySpontaneousSolve wi@ solves equalities where one side is a
+-- touchable unification variable.
+-- Returns True <=> spontaneous solve happened
+canSolveByUnification :: TcLevel -> TcTyVar -> TcType -> Bool
+canSolveByUnification tclvl tv xi
+  | isTouchableMetaTyVar tclvl tv
+  = case metaTyVarInfo tv of
+      SigTv -> is_tyvar xi
+      _     -> True
 
-Note [Prevent unification with type families]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  | otherwise    -- Untouchable
+  = False
+  where
+    is_tyvar xi
+      = case tcGetTyVar_maybe xi of
+          Nothing -> False
+          Just tv -> case tcTyVarDetails tv of
+                       MetaTv { mtv_info = info }
+                                   -> case info of
+                                        SigTv -> True
+                                        _     -> False
+                       SkolemTv {} -> True
+                       RuntimeUnk  -> True
+
+{- Note [Prevent unification with type families]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We prevent unification with type families because of an uneasy compromise.
 It's perfectly sound to unify with type families, and it even improves the
 error messages in the testsuite. It also modestly improves performance, at
@@ -1849,7 +1948,7 @@ lookupTcTyVar tyvar
 Note [Unifying untouchables]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We treat an untouchable type variable as if it was a skolem.  That
-ensures it won't unify with anything.  It's a slight had, because
+ensures it won't unify with anything.  It's a slight hack, because
 we return a made-up TcTyVarDetails, but I think it works smoothly.
 -}
 
@@ -1893,34 +1992,8 @@ matchExpectedFunKind hs_ty = go
 ********************************************************************* -}
 
 
-{- Note [Occurs check expansion]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-(occurCheckExpand tv xi) expands synonyms in xi just enough to get rid
-of occurrences of tv outside type function arguments, if that is
-possible; otherwise, it returns Nothing.
-
-For example, suppose we have
-  type F a b = [a]
-Then
-  occCheckExpand b (F Int b) = Just [Int]
-but
-  occCheckExpand a (F a Int) = Nothing
-
-We don't promise to do the absolute minimum amount of expanding
-necessary, but we try not to do expansions we don't need to.  We
-prefer doing inner expansions first.  For example,
-  type F a b = (a, Int, a, [a])
-  type G b   = Char
-We have
-  occCheckExpand b (F (G b)) = Just (F Char)
-even though we could also expand F to get rid of b.
-
-The two variants of the function are to support TcUnify.checkTauTvUpdate,
-which wants to prevent unification with type families. For more on this
-point, see Note [Prevent unification with type families] in TcUnify.
-
-Note [Occurrence checking: look inside kinds]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{-  Note [Occurrence checking: look inside kinds]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Suppose we are considering unifying
    (alpha :: *)  ~  Int -> (beta :: alpha -> alpha)
 This may be an error (what is that alpha doing inside beta's kind?),
@@ -1991,7 +2064,7 @@ occCheckForErrors dflags tv ty
   = case preCheck dflags True tv ty of
       OC_OK _   -> OC_OK ()
       OC_Bad    -> OC_Bad
-      OC_Occurs -> case occCheckExpand tv ty of
+      OC_Occurs -> case occCheckExpand [tv] ty of
                      Nothing -> OC_Occurs
                      Just _  -> OC_OK ()
 
@@ -2029,7 +2102,7 @@ metaTyVarUpdateOK dflags tv ty
          -- See Note [Prevent unification with type families]
       OC_OK _   -> Just ty
       OC_Bad    -> Nothing  -- forall or type function
-      OC_Occurs -> occCheckExpand tv ty
+      OC_Occurs -> occCheckExpand [tv] ty
 
 preCheck :: DynFlags -> Bool -> TcTyVar -> TcType -> OccCheckResult ()
 -- A quick check for
@@ -2089,121 +2162,6 @@ preCheck dflags ty_fam_ok tv ty
       | not (impredicative_ok || isTauTyCon tc)     = True
       | not (ty_fam_ok        || isFamFreeTyCon tc) = True
       | otherwise                                   = False
-
-occCheckExpand :: TcTyVar -> TcType -> Maybe TcType
--- See Note [Occurs check expansion]
--- We may have needed to do some type synonym unfolding in order to
--- get rid of the variable (or forall), so we also return the unfolded
--- version of the type, which is guaranteed to be syntactically free
--- of the given type variable.  If the type is already syntactically
--- free of the variable, then the same type is returned.
-occCheckExpand tv ty
-  = go emptyVarEnv ty
-  where
-    go :: VarEnv TyVar -> Type -> Maybe Type
-          -- The VarEnv carries mappings necessary
-          -- because of kind expansion
-    go env (TyVarTy tv')
-      | tv == tv'                         = Nothing
-      | Just tv'' <- lookupVarEnv env tv' = return (mkTyVarTy tv'')
-      | otherwise                         = do { tv'' <- go_var env tv'
-                                               ; return (mkTyVarTy tv'') }
-
-    go _   ty@(LitTy {}) = return ty
-    go env (AppTy ty1 ty2) = do { ty1' <- go env ty1
-                                ; ty2' <- go env ty2
-                                ; return (mkAppTy ty1' ty2') }
-    go env (FunTy ty1 ty2) = do { ty1' <- go env ty1
-                                ; ty2' <- go env ty2
-                                ; return (mkFunTy ty1' ty2') }
-    go env ty@(ForAllTy (TvBndr tv' vis) body_ty)
-       | tv == tv'         = return ty
-       | otherwise         = do { ki' <- go env (tyVarKind tv')
-                                ; let tv'' = setTyVarKind tv' ki'
-                                      env' = extendVarEnv env tv' tv''
-                                ; body' <- go env' body_ty
-                                ; return (ForAllTy (TvBndr tv'' vis) body') }
-
-    -- For a type constructor application, first try expanding away the
-    -- offending variable from the arguments.  If that doesn't work, next
-    -- see if the type constructor is a type synonym, and if so, expand
-    -- it and try again.
-    go env ty@(TyConApp tc tys)
-      = case mapM (go env) tys of
-          Just tys' -> return (mkTyConApp tc tys')
-          Nothing | Just ty' <- tcView ty -> go env ty'
-                  | otherwise             -> Nothing
-                      -- Failing that, try to expand a synonym
-
-    go env (CastTy ty co) =  do { ty' <- go env ty
-                                ; co' <- go_co env co
-                                ; return (mkCastTy ty' co') }
-    go env (CoercionTy co) = do { co' <- go_co env co
-                                ; return (mkCoercionTy co') }
-
-    ------------------
-    go_var env v = do { k' <- go env (varType v)
-                      ; return (setVarType v k') }
-           -- Works for TyVar and CoVar
-           -- See Note [Occurrence checking: look inside kinds]
-
-    ------------------
-    go_co env (Refl r ty)               = do { ty' <- go env ty
-                                             ; return (mkReflCo r ty') }
-      -- Note: Coercions do not contain type synonyms
-    go_co env (TyConAppCo r tc args)    = do { args' <- mapM (go_co env) args
-                                             ; return (mkTyConAppCo r tc args') }
-    go_co env (AppCo co arg)            = do { co' <- go_co env co
-                                             ; arg' <- go_co env arg
-                                             ; return (mkAppCo co' arg') }
-    go_co env co@(ForAllCo tv' kind_co body_co)
-      | tv == tv'         = return co
-      | otherwise         = do { kind_co' <- go_co env kind_co
-                               ; let tv'' = setTyVarKind tv' $
-                                            pFst (coercionKind kind_co')
-                                     env' = extendVarEnv env tv' tv''
-                               ; body' <- go_co env' body_co
-                               ; return (ForAllCo tv'' kind_co' body') }
-    go_co env (FunCo r co1 co2)         = do { co1' <- go_co env co1
-                                             ; co2' <- go_co env co2
-                                             ; return (mkFunCo r co1' co2') }
-    go_co env (CoVarCo c)               = do { c' <- go_var env c
-                                             ; return (mkCoVarCo c') }
-    go_co env (HoleCo h)                = do { c' <- go_var env (ch_co_var h)
-                                             ; return (HoleCo (h { ch_co_var = c' })) }
-    go_co env (AxiomInstCo ax ind args) = do { args' <- mapM (go_co env) args
-                                             ; return (mkAxiomInstCo ax ind args') }
-    go_co env (UnivCo p r ty1 ty2)      = do { p' <- go_prov env p
-                                             ; ty1' <- go env ty1
-                                             ; ty2' <- go env ty2
-                                             ; return (mkUnivCo p' r ty1' ty2') }
-    go_co env (SymCo co)                = do { co' <- go_co env co
-                                             ; return (mkSymCo co') }
-    go_co env (TransCo co1 co2)         = do { co1' <- go_co env co1
-                                             ; co2' <- go_co env co2
-                                             ; return (mkTransCo co1' co2') }
-    go_co env (NthCo r n co)            = do { co' <- go_co env co
-                                             ; return (mkNthCo r n co') }
-    go_co env (LRCo lr co)              = do { co' <- go_co env co
-                                             ; return (mkLRCo lr co') }
-    go_co env (InstCo co arg)           = do { co' <- go_co env co
-                                             ; arg' <- go_co env arg
-                                             ; return (mkInstCo co' arg') }
-    go_co env (CoherenceCo co1 co2)     = do { co1' <- go_co env co1
-                                             ; co2' <- go_co env co2
-                                             ; return (mkCoherenceCo co1' co2') }
-    go_co env (KindCo co)               = do { co' <- go_co env co
-                                             ; return (mkKindCo co') }
-    go_co env (SubCo co)                = do { co' <- go_co env co
-                                             ; return (mkSubCo co') }
-    go_co env (AxiomRuleCo ax cs)       = do { cs' <- mapM (go_co env) cs
-                                             ; return (mkAxiomRuleCo ax cs') }
-
-    ------------------
-    go_prov _   UnsafeCoerceProv    = return UnsafeCoerceProv
-    go_prov env (PhantomProv co)    = PhantomProv <$> go_co env co
-    go_prov env (ProofIrrelProv co) = ProofIrrelProv <$> go_co env co
-    go_prov _   p@(PluginProv _)    = return p
 
 canUnifyWithPolyType :: DynFlags -> TcTyVarDetails -> Bool
 canUnifyWithPolyType dflags details

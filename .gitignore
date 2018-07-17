@@ -35,6 +35,7 @@ __pycache__
 
 log
 tags
+TAGS
 
 autom4te.cache
 config.log
@@ -81,8 +82,7 @@ _darcs/
 /ghc/stage1/
 /ghc/stage2/
 /ghc/stage3/
-/iserv/stage2*/
-/iserv/dist/
+/utils/iserv/stage2*/
 
 # -----------------------------------------------------------------------------
 # specific generated files
@@ -145,6 +145,7 @@ _darcs/
 /libraries/ghc-boot-th/GNUmakefile
 /libraries/ghc-boot-th/ghc-boot-th.cabal
 /libraries/ghc-boot-th/ghc.mk
+/libraries/ghc-heap/ghc-heap.cabal
 /libraries/ghci/GNUmakefile
 /libraries/ghci/ghci.cabal
 /libraries/ghci/ghc.mk

@@ -82,6 +82,7 @@ data Extension
    | DeriveAnyClass           -- Allow deriving any class
    | DeriveLift               -- Allow deriving Lift
    | DerivingStrategies
+   | DerivingVia              -- Derive through equal representation
 
    | TypeSynonymInstances
    | FlexibleContexts
@@ -135,4 +136,6 @@ data Extension
    | MonadFailDesugaring
    | EmptyDataDeriving
    | NumericUnderscores
+   | QuantifiedConstraints
+   | StarIsType
    deriving (Eq, Enum, Show, Generic)

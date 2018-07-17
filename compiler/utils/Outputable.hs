@@ -24,11 +24,11 @@ module Outputable (
         text, ftext, ptext, ztext,
         int, intWithCommas, integer, word, float, double, rational, doublePrec,
         parens, cparen, brackets, braces, quotes, quote,
-        doubleQuotes, angleBrackets, paBrackets,
+        doubleQuotes, angleBrackets,
         semi, comma, colon, dcolon, space, equals, dot, vbar,
         arrow, larrow, darrow, arrowt, larrowt, arrowtt, larrowtt,
         lparen, rparen, lbrack, rbrack, lbrace, rbrace, underscore,
-        blankLine, forAllLit, kindStar, bullet,
+        blankLine, forAllLit, kindType, bullet,
         (<>), (<+>), hcat, hsep,
         ($$), ($+$), vcat,
         sep, cat,
@@ -82,7 +82,7 @@ module Outputable (
         -- * Error handling and debugging utilities
         pprPanic, pprSorry, assertPprPanic, pprPgmError,
         pprTrace, pprTraceDebug, pprTraceIt, warnPprTrace, pprSTrace,
-        pprTraceException,
+        pprTraceException, pprTraceM,
         trace, pgmError, panic, sorry, assertPanic,
         pprDebugAndThen, callStackDoc,
     ) where
@@ -91,7 +91,7 @@ import GhcPrelude
 
 import {-# SOURCE #-}   DynFlags( DynFlags, hasPprDebug, hasNoDebugOutput,
                                   targetPlatform, pprUserLength, pprCols,
-                                  useUnicode, useUnicodeSyntax,
+                                  useUnicode, useUnicodeSyntax, useStarIsType,
                                   shouldUseColor, unsafeGlobalDynFlags,
                                   shouldUseHexWordLiterals )
 import {-# SOURCE #-}   Module( UnitId, Module, ModuleName, moduleName )
@@ -592,7 +592,7 @@ doublePrec :: Int -> Double -> SDoc
 doublePrec p n = text (showFFloat (Just p) n "")
 
 parens, braces, brackets, quotes, quote,
-        paBrackets, doubleQuotes, angleBrackets :: SDoc -> SDoc
+        doubleQuotes, angleBrackets :: SDoc -> SDoc
 
 parens d        = SDoc $ Pretty.parens . runSDoc d
 braces d        = SDoc $ Pretty.braces . runSDoc d
@@ -600,7 +600,6 @@ brackets d      = SDoc $ Pretty.brackets . runSDoc d
 quote d         = SDoc $ Pretty.quote . runSDoc d
 doubleQuotes d  = SDoc $ Pretty.doubleQuotes . runSDoc d
 angleBrackets d = char '<' <> d <> char '>'
-paBrackets d    = text "[:" <> d <> text ":]"
 
 cparen :: Bool -> SDoc -> SDoc
 cparen b d = SDoc $ Pretty.maybeParens b . runSDoc d
@@ -651,8 +650,11 @@ rbrace     = docToSDoc $ Pretty.rbrace
 forAllLit :: SDoc
 forAllLit = unicodeSyntax (char '∀') (text "forall")
 
-kindStar :: SDoc
-kindStar = unicodeSyntax (char '★') (char '*')
+kindType :: SDoc
+kindType = sdocWithDynFlags $ \dflags ->
+    if useStarIsType dflags
+    then unicodeSyntax (char '★') (char '*')
+    else text "Type"
 
 bullet :: SDoc
 bullet = unicode (char '•') (char '*')
@@ -1181,6 +1183,9 @@ pprTrace str doc x
    | hasNoDebugOutput unsafeGlobalDynFlags = x
    | otherwise                             =
       pprDebugAndThen unsafeGlobalDynFlags trace (text str) doc x
+
+pprTraceM :: Applicative f => String -> SDoc -> f ()
+pprTraceM str doc = pprTrace str doc (pure ())
 
 -- | @pprTraceIt desc x@ is equivalent to @pprTrace desc (ppr x) x@
 pprTraceIt :: Outputable a => String -> a -> a

@@ -53,7 +53,7 @@ module DataCon (
         isVanillaDataCon, classDataCon, dataConCannotMatch,
         dataConUserTyVarsArePermuted,
         isBanged, isMarkedStrict, eqHsBang, isSrcStrict, isSrcUnpacked,
-        specialPromotedDc, isLegacyPromotableDataCon, isLegacyPromotableTyCon,
+        specialPromotedDc,
 
         -- ** Promotion related functions
         promoteDataCon
@@ -86,8 +86,7 @@ import Unique( mkAlphaTyVarUnique )
 import qualified Data.Data as Data
 import Data.Char
 import Data.Word
-import Data.List( mapAccumL, find )
-import qualified Data.Set as Set
+import Data.List( find )
 
 {-
 Data constructor representation
@@ -887,24 +886,12 @@ mkDataCon name declared_infix prom_info
   = con
   where
     is_vanilla = null ex_tvs && null eq_spec && null theta
-    -- Check the dcUserTyVarBinders invariant
-    -- (see Note [DataCon user type variable binders])
-    user_tvbs_invariant =
-         Set.fromList (filterEqSpec eq_spec univ_tvs ++ ex_tvs)
-      == Set.fromList (binderVars user_tvbs)
-    user_tvbs' =
-      ASSERT2( user_tvbs_invariant
-             , (vcat [ ppr name
-                     , ppr univ_tvs
-                     , ppr ex_tvs
-                     , ppr eq_spec
-                     , ppr user_tvbs ]) )
-      user_tvbs
+
     con = MkData {dcName = name, dcUnique = nameUnique name,
                   dcVanilla = is_vanilla, dcInfix = declared_infix,
                   dcUnivTyVars = univ_tvs,
                   dcExTyVars = ex_tvs,
-                  dcUserTyVarBinders = user_tvbs',
+                  dcUserTyVarBinders = user_tvbs,
                   dcEqSpec = eq_spec,
                   dcOtherTheta = theta,
                   dcStupidTheta = stupid_theta,
@@ -937,7 +924,7 @@ mkDataCon name declared_infix prom_info
 
       -- See Note [Promoted data constructors] in TyCon
     prom_tv_bndrs = [ mkNamedTyConBinder vis tv
-                    | TvBndr tv vis <- user_tvbs' ]
+                    | TvBndr tv vis <- user_tvbs ]
 
     prom_arg_bndrs = mkCleanAnonTyConBinders prom_tv_bndrs (theta ++ orig_arg_tys)
     prom_res_kind  = orig_res_ty
@@ -1189,7 +1176,7 @@ dataConInstSig (MkData { dcUnivTyVars = univ_tvs, dcExTyVars = ex_tvs
     , substTys   subst arg_tys)
   where
     univ_subst = zipTvSubst univ_tvs univ_tys
-    (subst, ex_tvs') = mapAccumL Type.substTyVarBndr univ_subst ex_tvs
+    (subst, ex_tvs') = Type.substTyVarBndrs univ_subst ex_tvs
 
 
 -- | The \"full signature\" of the 'DataCon' returns, in order:
@@ -1323,26 +1310,6 @@ isVanillaDataCon dc = dcVanilla dc
 -- Currently, only Lifted & Unlifted
 specialPromotedDc :: DataCon -> Bool
 specialPromotedDc = isKindTyCon . dataConTyCon
-
--- | Was this datacon promotable before GHC 8.0? That is, is it promotable
--- without -XTypeInType
-isLegacyPromotableDataCon :: DataCon -> Bool
-isLegacyPromotableDataCon dc
-  =  null (dataConEqSpec dc)  -- no GADTs
-  && null (dataConTheta dc)   -- no context
-  && not (isFamInstTyCon (dataConTyCon dc))   -- no data instance constructors
-  && uniqSetAll isLegacyPromotableTyCon (tyConsOfType (dataConUserType dc))
-
--- | Was this tycon promotable before GHC 8.0? That is, is it promotable
--- without -XTypeInType
-isLegacyPromotableTyCon :: TyCon -> Bool
-isLegacyPromotableTyCon tc
-  = isVanillaAlgTyCon tc ||
-      -- This returns True more often than it should, but it's quite painful
-      -- to make this fully accurate. And no harm is caused; we just don't
-      -- require -XTypeInType every time we need to. (We'll always require
-      -- -XDataKinds, though, so there's no standards-compliance issue.)
-    isFunTyCon tc || isKindTyCon tc
 
 classDataCon :: Class -> DataCon
 classDataCon clas = case tyConDataCons (classTyCon clas) of

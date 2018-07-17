@@ -5,12 +5,13 @@
 Functions for working with the typechecker environment (setters, getters...).
 -}
 
-{-# LANGUAGE CPP, ExplicitForAll, FlexibleInstances #-}
+{-# LANGUAGE CPP, ExplicitForAll, FlexibleInstances, BangPatterns #-}
+{-# LANGUAGE RecordWildCards #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module TcRnMonad(
   -- * Initalisation
-  initTc, initTcWithGbl, initTcInteractive, initTcForLookup, initTcRnIf,
+  initTc, initTcWithGbl, initTcInteractive, initTcRnIf,
 
   -- * Simple accessors
   discardResult,
@@ -177,7 +178,6 @@ import CostCentreState
 
 import qualified GHC.LanguageExtensions as LangExt
 
-import Control.Exception
 import Data.IORef
 import Control.Monad
 import Data.Set ( Set )
@@ -235,6 +235,12 @@ initTc hsc_env hsc_src keep_rn_syntax mod loc do_this
              maybe_rn_syntax :: forall a. a -> Maybe a ;
              maybe_rn_syntax empty_val
                 | dopt Opt_D_dump_rn_ast dflags = Just empty_val
+
+                  -- We want to serialize the documentation in the .hi-files,
+                  -- and need to extract it from the renamed syntax first.
+                  -- See 'ExtractDocs.extractDocs'.
+                | gopt Opt_Haddock dflags       = Just empty_val
+
                 | keep_rn_syntax                = Just empty_val
                 | otherwise                     = Nothing ;
 
@@ -249,9 +255,7 @@ initTc hsc_env hsc_src keep_rn_syntax mod loc do_this
 
                 tcg_mod            = mod,
                 tcg_semantic_mod   =
-                    if thisPackage dflags == moduleUnitId mod
-                        then canonicalizeHomeModule dflags (moduleName mod)
-                        else mod,
+                    canonicalizeModuleIfHome dflags mod,
                 tcg_src            = hsc_src,
                 tcg_rdr_env        = emptyGlobalRdrEnv,
                 tcg_fix_env        = emptyNameEnv,
@@ -293,7 +297,6 @@ initTc hsc_env hsc_src keep_rn_syntax mod loc do_this
                 tcg_fam_insts      = [],
                 tcg_rules          = [],
                 tcg_fords          = [],
-                tcg_vects          = [],
                 tcg_patsyns        = [],
                 tcg_merged         = [],
                 tcg_dfun_n         = dfun_n_var,
@@ -376,15 +379,6 @@ initTcInteractive hsc_env thing_inside
   where
     interactive_src_loc = mkRealSrcLoc (fsLit "<interactive>") 1 1
 
-initTcForLookup :: HscEnv -> TcM a -> IO a
--- The thing_inside is just going to look up something
--- in the environment, so we don't need much setup
-initTcForLookup hsc_env thing_inside
-  = do { (msgs, m) <- initTcInteractive hsc_env thing_inside
-       ; case m of
-             Nothing -> throwIO $ mkSrcErr $ snd msgs
-             Just x -> return x }
-
 {- Note [Default types]
 ~~~~~~~~~~~~~~~~~~~~~~~
 The Integer type is simply not available in package ghc-prim (it is
@@ -439,7 +433,7 @@ updTopEnv upd = updEnv (\ env@(Env { env_top = top }) ->
                           env { env_top = upd top })
 
 getGblEnv :: TcRnIf gbl lcl gbl
-getGblEnv = do { env <- getEnv; return (env_gbl env) }
+getGblEnv = do { Env{..} <- getEnv; return env_gbl }
 
 updGblEnv :: (gbl -> gbl) -> TcRnIf gbl lcl a -> TcRnIf gbl lcl a
 updGblEnv upd = updEnv (\ env@(Env { env_gbl = gbl }) ->
@@ -449,7 +443,7 @@ setGblEnv :: gbl -> TcRnIf gbl lcl a -> TcRnIf gbl lcl a
 setGblEnv gbl_env = updEnv (\ env -> env { env_gbl = gbl_env })
 
 getLclEnv :: TcRnIf gbl lcl lcl
-getLclEnv = do { env <- getEnv; return (env_lcl env) }
+getLclEnv = do { Env{..} <- getEnv; return env_lcl }
 
 updLclEnv :: (lcl -> lcl) -> TcRnIf gbl lcl a -> TcRnIf gbl lcl a
 updLclEnv upd = updEnv (\ env@(Env { env_lcl = lcl }) ->
@@ -1545,8 +1539,8 @@ setTcLevel tclvl thing_inside
 
 isTouchableTcM :: TcTyVar -> TcM Bool
 isTouchableTcM tv
-  = do { env <- getLclEnv
-       ; return (isTouchableMetaTyVar (tcl_tclvl env) tv) }
+  = do { lvl <- getTcLevel
+       ; return (isTouchableMetaTyVar lvl tv) }
 
 getLclTypeEnv :: TcM TcTypeEnv
 getLclTypeEnv = do { env <- getLclEnv; return (tcl_env env) }
@@ -1769,7 +1763,7 @@ initIfaceTcRn :: IfG a -> TcRn a
 initIfaceTcRn thing_inside
   = do  { tcg_env <- getGblEnv
         ; dflags <- getDynFlags
-        ; let mod = tcg_semantic_mod tcg_env
+        ; let !mod = tcg_semantic_mod tcg_env
               -- When we are instantiating a signature, we DEFINITELY
               -- do not want to knot tie.
               is_instantiate = unitIdIsDefinite (thisPackage dflags) &&

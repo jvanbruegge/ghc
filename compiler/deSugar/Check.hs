@@ -24,7 +24,6 @@ import GhcPrelude
 
 import TmOracle
 import Unify( tcMatchTy )
-import BasicTypes
 import DynFlags
 import HsSyn
 import TcHsSyn
@@ -40,11 +39,12 @@ import Util
 import Outputable
 import FastString
 import DataCon
+import PatSyn
 import HscTypes (CompleteMatch(..))
 
 import DsMonad
 import TcSimplify    (tcCheckSatisfiability)
-import TcType        (toTcType, isStringTy, isIntTy, isWordTy)
+import TcType        (isStringTy)
 import Bag
 import ErrUtils
 import Var           (EvVar)
@@ -53,6 +53,7 @@ import Type
 import UniqSupply
 import DsGRHSs       (isTrueLHsExpr)
 import Maybes        (expectJust)
+import qualified GHC.LanguageExtensions as LangExt
 
 import Data.List     (find)
 import Data.Maybe    (catMaybes, isJust, fromMaybe)
@@ -347,15 +348,17 @@ checkSingle' locn var p = do
 checkGuardMatches :: HsMatchContext Name          -- Match context
                   -> GRHSs GhcTc (LHsExpr GhcTc)  -- Guarded RHSs
                   -> DsM ()
-checkGuardMatches hs_ctx guards@(GRHSs grhss _) = do
+checkGuardMatches hs_ctx guards@(GRHSs _ grhss _) = do
     dflags <- getDynFlags
     let combinedLoc = foldl1 combineSrcSpans (map getLoc grhss)
         dsMatchContext = DsMatchContext hs_ctx combinedLoc
         match = L combinedLoc $
-                  Match { m_ctxt = hs_ctx
+                  Match { m_ext = noExt
+                        , m_ctxt = hs_ctx
                         , m_pats = []
                         , m_grhss = guards }
     checkMatches dflags dsMatchContext [] [match]
+checkGuardMatches _ (XGRHSs _) = panic "checkGuardMatches"
 
 -- | Check a matchgroup (case, functions, etc.)
 checkMatches :: DynFlags -> DsMatchContext
@@ -416,6 +419,7 @@ checkMatches' vars matches
 
     hsLMatchToLPats :: LMatch id body -> Located [LPat id]
     hsLMatchToLPats (L l (Match { m_pats = pats })) = L l pats
+    hsLMatchToLPats (L _ (XMatch _)) = panic "checMatches'"
 
 -- | Check an empty case expression. Since there are no clauses to process, we
 --   only compute the uncovered set. See Note [Checking EmptyCase Expressions]
@@ -620,12 +624,12 @@ inhabitationCandidates fam_insts ty
       Just (tc, _)
         | tc `elem` trivially_inhabited -> case dcs of
             []    -> return (Left src_ty)
-            (_:_) -> do var <- liftD $ mkPmId (toTcType core_ty)
+            (_:_) -> do var <- liftD $ mkPmId core_ty
                         let va = build_tm (PmVar var) dcs
                         return $ Right [(va, mkIdEq var, emptyBag)]
 
         | pmIsClosedType core_ty -> liftD $ do
-            var  <- mkPmId (toTcType core_ty) -- it would be wrong to unify x
+            var  <- mkPmId core_ty -- it would be wrong to unify x
             alts <- mapM (mkOneConFull var . RealDataCon) (tyConDataCons tc)
             return $ Right [(build_tm va dcs, eq, cs) | (va, eq, cs) <- alts]
       -- For other types conservatively assume that they are inhabited.
@@ -780,23 +784,36 @@ translatePat fam_insts pat = case pat of
       False -> mkCanFailPmPat arg_ty
 
   -- list
-  ListPat _ ps ty Nothing -> do
+  ListPat (ListPatTc ty Nothing) ps -> do
     foldr (mkListPatVec ty) [nilPattern ty]
       <$> translatePatVec fam_insts (map unLoc ps)
 
   -- overloaded list
-  ListPat x lpats elem_ty (Just (pat_ty, _to_list))
-    | Just e_ty <- splitListTyConApp_maybe pat_ty
-    , (_, norm_elem_ty) <- normaliseType fam_insts Nominal elem_ty
-         -- elem_ty is frequently something like
-         -- `Item [Int]`, but we prefer `Int`
-    , norm_elem_ty `eqType` e_ty ->
-        -- We have to ensure that the element types are exactly the same.
-        -- Otherwise, one may give an instance IsList [Int] (more specific than
-        -- the default IsList [a]) with a different implementation for `toList'
-        translatePat fam_insts (ListPat x lpats e_ty Nothing)
-      -- See Note [Guards and Approximation]
-    | otherwise -> mkCanFailPmPat pat_ty
+  ListPat (ListPatTc _elem_ty (Just (pat_ty, _to_list))) lpats -> do
+    dflags <- getDynFlags
+    if xopt LangExt.RebindableSyntax dflags
+       then mkCanFailPmPat pat_ty
+       else case splitListTyConApp_maybe pat_ty of
+              Just e_ty -> translatePat fam_insts
+                                        (ListPat (ListPatTc e_ty Nothing) lpats)
+              Nothing   -> mkCanFailPmPat pat_ty
+    -- (a) In the presence of RebindableSyntax, we don't know anything about
+    --     `toList`, we should treat `ListPat` as any other view pattern.
+    --
+    -- (b) In the absence of RebindableSyntax,
+    --     - If the pat_ty is `[a]`, then we treat the overloaded list pattern
+    --       as ordinary list pattern. Although we can give an instance
+    --       `IsList [Int]` (more specific than the default `IsList [a]`), in
+    --       practice, we almost never do that. We assume the `_to_list` is
+    --       the `toList` from `instance IsList [a]`.
+    --
+    --     - Otherwise, we treat the `ListPat` as ordinary view pattern.
+    --
+    -- See Trac #14547, especially comment#9 and comment#10.
+    --
+    -- Here we construct CanFailPmPat directly, rather can construct a view
+    -- pattern and do further translation as an optimization, for the reason,
+    -- see Note [Guards and Approximation].
 
   ConPatOut { pat_con     = L _ con
             , pat_arg_tys = arg_tys
@@ -814,20 +831,22 @@ translatePat fam_insts pat = case pat of
                       , pm_con_dicts   = dicts
                       , pm_con_args    = args }]
 
-  NPat ty (L _ ol) mb_neg _eq -> translateNPat fam_insts ol mb_neg ty
+  -- See Note [Translate Overloaded Literal for Exhaustiveness Checking]
+  NPat _ (L _ olit) mb_neg _
+    | OverLit (OverLitTc False ty) (HsIsString src s) _ <- olit
+    , isStringTy ty ->
+        foldr (mkListPatVec charTy) [nilPattern charTy] <$>
+          translatePatVec fam_insts
+            (map (LitPat noExt . HsChar src) (unpackFS s))
+    | otherwise -> return [PmLit { pm_lit_lit = PmOLit (isJust mb_neg) olit }]
 
+  -- See Note [Translate Overloaded Literal for Exhaustiveness Checking]
   LitPat _ lit
-      -- If it is a string then convert it to a list of characters
     | HsString src s <- lit ->
         foldr (mkListPatVec charTy) [nilPattern charTy] <$>
           translatePatVec fam_insts
-                            (map (LitPat noExt  . HsChar src) (unpackFS s))
+            (map (LitPat noExt . HsChar src) (unpackFS s))
     | otherwise -> return [mkLitPattern lit]
-
-  PArrPat ty ps -> do
-    tidy_ps <- translatePatVec fam_insts (map unLoc ps)
-    let fake_con = RealDataCon (parrFakeCon (length ps))
-    return [vanillaConPattern fake_con [ty] (concat tidy_ps)]
 
   TuplePat tys ps boxity -> do
     tidy_ps <- translatePatVec fam_insts (map unLoc ps)
@@ -845,29 +864,90 @@ translatePat fam_insts pat = case pat of
   SplicePat {} -> panic "Check.translatePat: SplicePat"
   XPat      {} -> panic "Check.translatePat: XPat"
 
--- | Translate an overloaded literal (see `tidyNPat' in deSugar/MatchLit.hs)
-translateNPat :: FamInstEnvs
-              -> HsOverLit GhcTc -> Maybe (SyntaxExpr GhcTc) -> Type
-              -> DsM PatVec
-translateNPat fam_insts (OverLit (OverLitTc False ty) val _ ) mb_neg outer_ty
-  | not type_change, isStringTy ty, HsIsString src s <- val, Nothing <- mb_neg
-  = translatePat fam_insts (LitPat noExt (HsString src s))
-  | not type_change, isIntTy    ty, HsIntegral i <- val
-  = translatePat fam_insts
-                 (LitPat noExt $ case mb_neg of
-                             Nothing -> HsInt noExt i
-                             Just _  -> HsInt noExt (negateIntegralLit i))
-  | not type_change, isWordTy   ty, HsIntegral i <- val
-  = translatePat fam_insts
-                 (LitPat noExt $ case mb_neg of
-                             Nothing -> HsWordPrim (il_text i) (il_value i)
-                             Just _  -> let ni = negateIntegralLit i in
-                                        HsWordPrim (il_text ni) (il_value ni))
-  where
-    type_change = not (outer_ty `eqType` ty)
+{- Note [Translate Overloaded Literal for Exhaustiveness Checking]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The translation of @NPat@ in exhaustiveness checker is a bit different
+from translation in pattern matcher.
 
-translateNPat _ ol mb_neg _
-  = return [PmLit { pm_lit_lit = PmOLit (isJust mb_neg) ol }]
+  * In pattern matcher (see `tidyNPat' in deSugar/MatchLit.hs), we
+    translate integral literals to HsIntPrim or HsWordPrim and translate
+    overloaded strings to HsString.
+
+  * In exhaustiveness checker, in `genCaseTmCs1/genCaseTmCs2`, we use
+    `lhsExprToPmExpr` to generate uncovered set. In `hsExprToPmExpr`,
+    however we generate `PmOLit` for HsOverLit, rather than refine
+    `HsOverLit` inside `NPat` to HsIntPrim/HsWordPrim. If we do
+    the same thing in `translatePat` as in `tidyNPat`, the exhaustiveness
+    checker will fail to match the literals patterns correctly. See
+    Trac #14546.
+
+  In Note [Undecidable Equality for Overloaded Literals], we say: "treat
+  overloaded literals that look different as different", but previously we
+  didn't do such things.
+
+  Now, we translate the literal value to match and the literal patterns
+  consistently:
+
+  * For integral literals, we parse both the integral literal value and
+    the patterns as OverLit HsIntegral. For example:
+
+      case 0::Int of
+          0 -> putStrLn "A"
+          1 -> putStrLn "B"
+          _ -> putStrLn "C"
+
+    When checking the exhaustiveness of pattern matching, we translate the 0
+    in value position as PmOLit, but translate the 0 and 1 in pattern position
+    as PmSLit. The inconsistency leads to the failure of eqPmLit to detect the
+    equality and report warning of "Pattern match is redundant" on pattern 0,
+    as reported in Trac #14546. In this patch we remove the specialization of
+    OverLit patterns, and keep the overloaded number literal in pattern as it
+    is to maintain the consistency. We know nothing about the `fromInteger`
+    method (see Note [Undecidable Equality for Overloaded Literals]). Now we
+    can capture the exhaustiveness of pattern 0 and the redundancy of pattern
+    1 and _.
+
+  * For string literals, we parse the string literals as HsString. When
+    OverloadedStrings is enabled, it further be turned as HsOverLit HsIsString.
+    For example:
+
+      case "foo" of
+          "foo" -> putStrLn "A"
+          "bar" -> putStrLn "B"
+          "baz" -> putStrLn "C"
+
+    Previously, the overloaded string values are translated to PmOLit and the
+    non-overloaded string values are translated to PmSLit. However the string
+    patterns, both overloaded and non-overloaded, are translated to list of
+    characters. The inconsistency leads to wrong warnings about redundant and
+    non-exhaustive pattern matching warnings, as reported in Trac #14546.
+
+    In order to catch the redundant pattern in following case:
+
+      case "foo" of
+          ('f':_) -> putStrLn "A"
+          "bar" -> putStrLn "B"
+
+    in this patch, we translate non-overloaded string literals, both in value
+    position and pattern position, as list of characters. For overloaded string
+    literals, we only translate it to list of characters only when it's type
+    is stringTy, since we know nothing about the toString methods. But we know
+    that if two overloaded strings are syntax equal, then they are equal. Then
+    if it's type is not stringTy, we just translate it to PmOLit. We can still
+    capture the exhaustiveness of pattern "foo" and the redundancy of pattern
+    "bar" and "baz" in the following code:
+
+      {-# LANGUAGE OverloadedStrings #-}
+      main = do
+        case "foo" of
+            "foo" -> putStrLn "A"
+            "bar" -> putStrLn "B"
+            "baz" -> putStrLn "C"
+
+  We must ensure that doing the same translation to literal values and patterns
+  in `translatePat` and `hsExprToPmExpr`. The previous inconsistent work led to
+  Trac #14546.
+-}
 
 -- | Translate a list of patterns (Note: each pattern is translated
 -- to a pattern vector but we do not concatenate the results).
@@ -939,10 +1019,12 @@ translateMatch fam_insts (L _ (Match { m_pats = lpats, m_grhss = grhss })) = do
   return (pats', guards')
   where
     extractGuards :: LGRHS GhcTc (LHsExpr GhcTc) -> [GuardStmt GhcTc]
-    extractGuards (L _ (GRHS gs _)) = map unLoc gs
+    extractGuards (L _ (GRHS _ gs _)) = map unLoc gs
+    extractGuards (L _ (XGRHS _)) = panic "translateMatch"
 
     pats   = map unLoc lpats
     guards = map extractGuards (grhssGRHSs grhss)
+translateMatch _ (L _ (XMatch _)) = panic "translateMatch"
 
 -- -----------------------------------------------------------------------
 -- * Transform source guards (GuardStmt Id) to PmPats (Pattern)
@@ -990,14 +1072,15 @@ cantFailPattern _ = False
 -- | Translate a guard statement to Pattern
 translateGuard :: FamInstEnvs -> GuardStmt GhcTc -> DsM PatVec
 translateGuard fam_insts guard = case guard of
-  BodyStmt   e _ _ _ -> translateBoolGuard e
-  LetStmt      binds -> translateLet (unLoc binds)
-  BindStmt p e _ _ _ -> translateBind fam_insts p e
+  BodyStmt _   e _ _ -> translateBoolGuard e
+  LetStmt  _   binds -> translateLet (unLoc binds)
+  BindStmt _ p e _ _ -> translateBind fam_insts p e
   LastStmt        {} -> panic "translateGuard LastStmt"
   ParStmt         {} -> panic "translateGuard ParStmt"
   TransStmt       {} -> panic "translateGuard TransStmt"
   RecStmt         {} -> panic "translateGuard RecStmt"
   ApplicativeStmt {} -> panic "translateGuard ApplicativeLastStmt"
+  XStmtLR         {} -> panic "translateGuard RecStmt"
 
 -- | Translate let-bindings
 translateLet :: HsLocalBinds GhcTc -> DsM PatVec
@@ -1067,7 +1150,7 @@ An overloaded list @[...]@ should be translated to @x ([...] <- toList x)@. The
 problem is exactly like above, as its solution. For future reference, the code
 below is the *right thing to do*:
 
-   ListPat lpats elem_ty (Just (pat_ty, to_list))
+   ListPat (ListPatTc elem_ty (Just (pat_ty, _to_list))) lpats
      otherwise -> do
        (xp, xe) <- mkPmId2Forms pat_ty
        ps       <- translatePatVec (map unLoc lpats)
@@ -1080,7 +1163,7 @@ below is the *right thing to do*:
 The case with literals is a bit different. a literal @l@ should be translated
 to @x (True <- x == from l)@. Since we want to have better warnings for
 overloaded literals as it is a very common feature, we treat them differently.
-They are mainly covered in Note [Undecidable Equality on Overloaded Literals]
+They are mainly covered in Note [Undecidable Equality for Overloaded Literals]
 in PmExpr.
 
 4. N+K Patterns & Pattern Synonyms
@@ -1298,19 +1381,75 @@ allCompleteMatches cl tys = do
   let final_groups = fam ++ from_pragma
   return final_groups
     where
-      -- Check that all the pattern types in a `COMPLETE`
-      -- pragma subsume the type we're matching. See #14135.
+      -- Check that all the pattern synonym return types in a `COMPLETE`
+      -- pragma subsume the type we're matching.
+      -- See Note [Filtering out non-matching COMPLETE sets]
       isValidCompleteMatch :: Type -> [ConLike] -> Bool
-      isValidCompleteMatch ty =
-        isJust . mapM (flip tcMatchTy ty . resTy . conLikeFullSig)
+      isValidCompleteMatch ty = all go
         where
-          resTy (_, _, _, _, _, _, res_ty) = res_ty
+          go (RealDataCon {}) = True
+          go (PatSynCon psc)  = isJust $ flip tcMatchTy ty $ patSynResTy
+                                       $ patSynSig psc
+
+          patSynResTy (_, _, _, _, _, res_ty) = res_ty
+
+{-
+Note [Filtering out non-matching COMPLETE sets]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Currently, conlikes in a COMPLETE set are simply grouped by the
+type constructor heading the return type. This is nice and simple, but it does
+mean that there are scenarios when a COMPLETE set might be incompatible with
+the type of a scrutinee. For instance, consider (from #14135):
+
+  data Foo a = Foo1 a | Foo2 a
+
+  pattern MyFoo2 :: Int -> Foo Int
+  pattern MyFoo2 i = Foo2 i
+
+  {-# COMPLETE Foo1, MyFoo2 #-}
+
+  f :: Foo a -> a
+  f (Foo1 x) = x
+
+`f` has an incomplete pattern-match, so when choosing which constructors to
+report as unmatched in a warning, GHC must choose between the original set of
+data constructors {Foo1, Foo2} and the COMPLETE set {Foo1, MyFoo2}. But observe
+that GHC shouldn't even consider the COMPLETE set as a possibility: the return
+type of MyFoo2, Foo Int, does not match the type of the scrutinee, Foo a, since
+there's no substitution `s` such that s(Foo Int) = Foo a.
+
+To ensure that GHC doesn't pick this COMPLETE set, it checks each pattern
+synonym constructor's return type matches the type of the scrutinee, and if one
+doesn't, then we remove the whole COMPLETE set from consideration.
+
+One might wonder why GHC only checks /pattern synonym/ constructors, and not
+/data/ constructors as well. The reason is because that the type of a
+GADT constructor very well may not match the type of a scrutinee, and that's
+OK. Consider this example (from #14059):
+
+  data SBool (z :: Bool) where
+    SFalse :: SBool False
+    STrue  :: SBool True
+
+  pattern STooGoodToBeTrue :: forall (z :: Bool). ()
+                           => z ~ True
+                           => SBool z
+  pattern STooGoodToBeTrue = STrue
+  {-# COMPLETE SFalse, STooGoodToBeTrue #-}
+
+  wobble :: SBool z -> Bool
+  wobble STooGoodToBeTrue = True
+
+In the incomplete pattern match for `wobble`, we /do/ want to warn that SFalse
+should be matched against, even though its type, SBool False, does not match
+the scrutinee type, SBool z.
+-}
 
 -- -----------------------------------------------------------------------
 -- * Types and constraints
 
 newEvVar :: Name -> Type -> EvVar
-newEvVar name ty = mkLocalId name (toTcType ty)
+newEvVar name ty = mkLocalId name ty
 
 nameType :: String -> Type -> DsM EvVar
 nameType name ty = do

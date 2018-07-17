@@ -31,6 +31,15 @@ test('T10359',
      compile_and_run,
      ['-O'])
 
+test('T14955',
+     [stats_num_field('bytes allocated',
+          [(wordsize(64), 48050760, 5),
+           (wordsize(32), 351508, 5)]),
+      only_ways(['normal'])
+      ],
+     multimod_compile_and_run,
+     ['T14955', '-O'])
+
 # fortunately the values here are mostly independent of the wordsize,
 # because the test allocates an unboxed array of doubles.
 test('T3586',
@@ -308,10 +317,11 @@ test('T7257',
                         # expected value: 1246287228 (i386/Linux)
                         # 2016-04-06: 989850664 (i386/Linux) no idea what happened
                         # 2017-03-25: 869850704 (x86/Linux, 64-bit machine) probably sizeExpr fix
-                       (wordsize(64), 1414893248, 5)]),
+                       (wordsize(64), 1297293264, 5)]),
                         # 2012-09-21: 1774893760 (amd64/Linux)
                         # 2015-11-03: 1654893248 (amd64/Linux)
                         # 2016-06-22: 1414893248 (amd64/Linux, sizeExpr fix)
+                        # 2018-06-22: 1297293264 (amd64/Linux, atomicModifyMutVar# replacement)
       stats_num_field('peak_megabytes_allocated',
                       [(wordsize(32), 217, 5),
                         # 2012-10-08: 217 (x86/Linux)
@@ -375,8 +385,9 @@ test('T7954',
                       [(wordsize(32), 920045264, 10),
               # some date:  1380051408    (64-bit Windows machine)
               # 2014-04-04:  920045264    (64-bit Windows machine)
-                       (wordsize(64), 1680051336, 10)]),
+                       (wordsize(64), 1280051632, 10)]),
               # 2014-02-10: 1680051336 (x86_64/Linux), call arity analysis
+              # 2018-05-03: 1280051632 (x86_64/Linux), refactor numericEnumFrom
       only_ways(['normal'])
       ],
      compile_and_run,
@@ -552,13 +563,34 @@ test('T13623',
     ['-O2'])
 
 test('T14052',
-     [stats_num_field('bytes allocated',
-                      [ (wordsize(64), 2346183840, 10) ])],
+     [compiler_stats_num_field('bytes allocated',
+                      [ (wordsize(64), 2346183840, 15) ])],
      ghci_script,
      ['T14052.script'])
 
 test('T14936',
      [stats_num_field('bytes allocated',
-                      [ (wordsize(64), 51792, 5) ])],
+                      [(platform('x86_64-unknown-mingw32'),   47536, 10),
+                       # 2018-05-04     47536 unknown
+                       (wordsize(64), 51792, 5) ])],
      compile_and_run,
      ['-O2'])
+
+test('T15226',
+    [stats_num_field('bytes allocated',
+                    [ (wordsize(64), 41040, 5) ]),
+                    # 2018-06-06   41040  Let the simplifier know the result
+                    #                     of seq# is in WHNF
+                    # initial  400041040
+     only_ways(['normal'])],
+    compile_and_run,
+    ['-O'])
+
+test('T15226a',
+    [stats_num_field('bytes allocated',
+                    [ (wordsize(64), 41040, 5) ]),
+                    # 2018-06-06   41040  Look through casts for seq#
+                    # initial  400041040
+     only_ways(['normal'])],
+    compile_and_run,
+    ['-O'])

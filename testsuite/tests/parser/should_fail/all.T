@@ -110,6 +110,7 @@ test('T13450', normal, compile_fail, [''])
 test('T13450TH', normal, compile_fail, [''])
 test('T14588', normal, compile_fail, [''])
 test('T14740', normal, compile_fail, [''])
+test('T15209', normal, compile_fail, [''])
 
 test('NoNumericUnderscores0', normal, compile_fail, [''])
 test('NoNumericUnderscores1', normal, compile_fail, [''])
@@ -119,3 +120,9 @@ test('NumericUnderscoresFail1',
      grep_errmsg(r'^NumericUnderscoresFail1.hs:'), compile_fail, [''])
 
 test('InfixAppPatErr', normal, compile_fail, [''])
+
+test('typeops_A', normal, compile_fail, [''])
+test('typeops_B', normal, compile_fail, [''])
+test('typeops_C', normal, compile_fail, [''])
+test('typeops_D', normal, compile_fail, [''])
+test('T15053', expect_broken(15053), compile_fail, ['']) # shouldn't panic

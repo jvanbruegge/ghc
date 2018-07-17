@@ -24,10 +24,13 @@ import Class
 import TyCon
 import TyCoRep   -- cleverly decomposes types, good for completeness checking
 import Coercion
+import CoreSyn
+import Id( idType, mkTemplateLocals )
 import FamInstEnv ( FamInstEnvs )
 import FamInst ( tcTopNormaliseNewTypeTF_maybe )
 import Var
 import VarEnv( mkInScopeSet )
+import VarSet( delVarSetList )
 import Outputable
 import DynFlags( DynFlags )
 import NameSet
@@ -81,15 +84,31 @@ last time through, so we can skip the classification step.
 canonicalize :: Ct -> TcS (StopOrContinue Ct)
 canonicalize (CNonCanonical { cc_ev = ev })
   = {-# SCC "canNC" #-}
-    case classifyPredType (ctEvPred ev) of
+    case classifyPredType pred of
       ClassPred cls tys     -> do traceTcS "canEvNC:cls" (ppr cls <+> ppr tys)
                                   canClassNC ev cls tys
       EqPred eq_rel ty1 ty2 -> do traceTcS "canEvNC:eq" (ppr ty1 $$ ppr ty2)
                                   canEqNC    ev eq_rel ty1 ty2
-      IrredPred {}          -> do traceTcS "canEvNC:irred" (ppr (ctEvPred ev))
+      IrredPred {}          -> do traceTcS "canEvNC:irred" (ppr pred)
                                   canIrred ev
+      ForAllPred _ _ pred   -> do traceTcS "canEvNC:forall" (ppr pred)
+                                  canForAll ev (isClassPred pred)
+  where
+    pred = ctEvPred ev
+
+canonicalize (CQuantCan (QCI { qci_ev = ev, qci_pend_sc = pend_sc }))
+  = canForAll ev pend_sc
 
 canonicalize (CIrredCan { cc_ev = ev })
+  | EqPred eq_rel ty1 ty2 <- classifyPredType (ctEvPred ev)
+  = -- For insolubles (all of which are equalities, do /not/ flatten the arguments
+    -- In Trac #14350 doing so led entire-unnecessary and ridiculously large
+    -- type function expansion.  Instead, canEqNC just applies
+    -- the substitution to the predicate, and may do decomposition;
+    --    e.g. a ~ [a], where [G] a ~ [Int], can decompose
+    canEqNC ev eq_rel ty1 ty2
+
+  | otherwise
   = canIrred ev
 
 canonicalize (CDictCan { cc_ev = ev, cc_class  = cls
@@ -130,7 +149,7 @@ canClassNC :: CtEvidence -> Class -> [Type] -> TcS (StopOrContinue Ct)
 -- Precondition: EvVar is class evidence
 canClassNC ev cls tys
   | isGiven ev  -- See Note [Eagerly expand given superclasses]
-  = do { sc_cts <- mkStrictSuperClasses ev cls tys
+  = do { sc_cts <- mkStrictSuperClasses ev [] [] cls tys
        ; emitWork sc_cts
        ; canClass ev cls tys False }
 
@@ -174,7 +193,7 @@ solveCallStack ev ev_cs = do
   -- `IP ip CallStack`. See Note [Overview of implicit CallStacks]
   cs_tm <- evCallStack ev_cs
   let ev_tm = mkEvCast cs_tm (wrapIP (ctEvPred ev))
-  setWantedEvBind (ctEvEvId ev) (EvExpr ev_tm)
+  setEvBindIfWanted ev ev_tm
 
 canClass :: CtEvidence
          -> Class -> [Type]
@@ -269,6 +288,15 @@ So here's the plan:
 
    This may succeed in generating (a finite number of) extra Givens,
    and extra Deriveds. Both may help the proof.
+
+3a An important wrinkle: only expand Givens from the current level.
+   Two reasons:
+      - We only want to expand it once, and that is best done at
+        the level it is bound, rather than repeatedly at the leaves
+        of the implication tree
+      - We may be inside a type where we can't create term-level
+        evidence anyway, so we can't superclass-expand, say,
+        (a ~ b) to get (a ~# b).  This happened in Trac #15290.
 
 4. Go round to (2) again.  This loop (2,3,4) is implemented
    in TcSimplify.simpl_loop.
@@ -424,67 +452,52 @@ makeSuperClasses :: [Ct] -> TcS [Ct]
 makeSuperClasses cts = concatMapM go cts
   where
     go (CDictCan { cc_ev = ev, cc_class = cls, cc_tyargs = tys })
-          = mkStrictSuperClasses ev cls tys
+      = mkStrictSuperClasses ev [] [] cls tys
+    go (CQuantCan (QCI { qci_pred = pred, qci_ev = ev }))
+      = ASSERT2( isClassPred pred, ppr pred )  -- The cts should all have
+                                               -- class pred heads
+        mkStrictSuperClasses ev tvs theta cls tys
+      where
+        (tvs, theta, cls, tys) = tcSplitDFunTy (ctEvPred ev)
     go ct = pprPanic "makeSuperClasses" (ppr ct)
 
-mkStrictSuperClasses :: CtEvidence -> Class -> [Type] -> TcS [Ct]
--- Return constraints for the strict superclasses of (c tys)
-mkStrictSuperClasses ev cls tys
-  = mk_strict_superclasses (unitNameSet (className cls)) ev cls tys
+mkStrictSuperClasses
+    :: CtEvidence
+    -> [TyVar] -> ThetaType  -- These two args are non-empty only when taking
+                             -- superclasses of a /quantified/ constraint
+    -> Class -> [Type] -> TcS [Ct]
+-- Return constraints for the strict superclasses of
+--   ev :: forall as. theta => cls tys
+mkStrictSuperClasses ev tvs theta cls tys
+  = mk_strict_superclasses (unitNameSet (className cls))
+                           ev tvs theta cls tys
 
-mk_superclasses :: NameSet -> CtEvidence -> TcS [Ct]
--- Return this constraint, plus its superclasses, if any
-mk_superclasses rec_clss ev
-  | ClassPred cls tys <- classifyPredType (ctEvPred ev)
-  = mk_superclasses_of rec_clss ev cls tys
-
-  | otherwise   -- Superclass is not a class predicate
-  = return [mkNonCanonical ev]
-
-mk_superclasses_of :: NameSet -> CtEvidence -> Class -> [Type] -> TcS [Ct]
--- Always return this class constraint,
--- and expand its superclasses
-mk_superclasses_of rec_clss ev cls tys
-  | loop_found = do { traceTcS "mk_superclasses_of: loop" (ppr cls <+> ppr tys)
-                    ; return [this_ct] }  -- cc_pend_sc of this_ct = True
-  | otherwise  = do { traceTcS "mk_superclasses_of" (vcat [ ppr cls <+> ppr tys
-                                                          , ppr (isCTupleClass cls)
-                                                          , ppr rec_clss
-                                                          ])
-                    ; sc_cts <- mk_strict_superclasses rec_clss' ev cls tys
-                    ; return (this_ct : sc_cts) }
-                                   -- cc_pend_sc of this_ct = False
-  where
-    cls_nm     = className cls
-    loop_found = not (isCTupleClass cls) && cls_nm `elemNameSet` rec_clss
-                 -- Tuples never contribute to recursion, and can be nested
-    rec_clss'  = rec_clss `extendNameSet` cls_nm
-    this_ct    = CDictCan { cc_ev = ev, cc_class = cls, cc_tyargs = tys
-                          , cc_pend_sc = loop_found }
-                 -- NB: If there is a loop, we cut off, so we have not
-                 --     added the superclasses, hence cc_pend_sc = True
-
-mk_strict_superclasses :: NameSet -> CtEvidence -> Class -> [Type] -> TcS [Ct]
+mk_strict_superclasses :: NameSet -> CtEvidence
+                       -> [TyVar] -> ThetaType
+                       -> Class -> [Type] -> TcS [Ct]
 -- Always return the immediate superclasses of (cls tys);
 -- and expand their superclasses, provided none of them are in rec_clss
 -- nor are repeated
-mk_strict_superclasses rec_clss ev cls tys
+mk_strict_superclasses rec_clss ev tvs theta cls tys
   | CtGiven { ctev_evar = evar, ctev_loc = loc } <- ev
-  = do { sc_evs <- newGivenEvVars (mk_given_loc loc)
-                                  (mkEvScSelectors (evId evar) cls tys)
-       ; concatMapM (mk_superclasses rec_clss) sc_evs }
-
-  | all noFreeVarsOfType tys
-  = return [] -- Wanteds with no variables yield no deriveds.
-              -- See Note [Improvement from Ground Wanteds]
-
-  | otherwise -- Wanted/Derived case, just add Derived superclasses
-              -- that can lead to improvement.
-  = do { let loc = ctEvLoc ev
-       ; sc_evs <- mapM (newDerivedNC loc) (immSuperClasses cls tys)
-       ; concatMapM (mk_superclasses rec_clss) sc_evs }
+  = concatMapM (do_one_given evar (mk_given_loc loc)) $
+    classSCSelIds cls
   where
-    size = sizeTypes tys
+    dict_ids  = mkTemplateLocals theta
+    size      = sizeTypes tys
+
+    do_one_given evar given_loc sel_id
+      = do { let sc_pred = funResultTy (piResultTys (idType sel_id) tys)
+                 given_ty = mkInfSigmaTy tvs theta sc_pred
+           ; given_ev <- newGivenEvVar given_loc $
+                         (given_ty, mk_sc_sel evar sel_id)
+           ; mk_superclasses rec_clss given_ev tvs theta sc_pred }
+
+    mk_sc_sel evar sel_id
+      = EvExpr $ mkLams tvs $ mkLams dict_ids $
+        Var sel_id `mkTyApps` tys `App`
+        (evId evar `mkTyApps` mkTyVarTys tvs `mkVarApps` dict_ids)
+
     mk_given_loc loc
        | isCTupleClass cls
        = loc   -- For tuple predicates, just take them apart, without
@@ -503,6 +516,63 @@ mk_strict_superclasses rec_clss ev cls tys
        | otherwise  -- Probably doesn't happen, since this function
        = loc        -- is only used for Givens, but does no harm
 
+mk_strict_superclasses rec_clss ev tvs theta cls tys
+  | all noFreeVarsOfType tys
+  = return [] -- Wanteds with no variables yield no deriveds.
+              -- See Note [Improvement from Ground Wanteds]
+
+  | otherwise -- Wanted/Derived case, just add Derived superclasses
+              -- that can lead to improvement.
+  = ASSERT2( null tvs && null theta, ppr tvs $$ ppr theta )
+    concatMapM do_one_derived (immSuperClasses cls tys)
+  where
+    loc = ctEvLoc ev
+
+    do_one_derived sc_pred
+      = do { sc_ev <- newDerivedNC loc sc_pred
+           ; mk_superclasses rec_clss sc_ev [] [] sc_pred }
+
+mk_superclasses :: NameSet -> CtEvidence
+                -> [TyVar] -> ThetaType -> PredType -> TcS [Ct]
+-- Return this constraint, plus its superclasses, if any
+mk_superclasses rec_clss ev tvs theta pred
+  | ClassPred cls tys <- classifyPredType pred
+  = mk_superclasses_of rec_clss ev tvs theta cls tys
+
+  | otherwise   -- Superclass is not a class predicate
+  = return [mkNonCanonical ev]
+
+mk_superclasses_of :: NameSet -> CtEvidence
+                   -> [TyVar] -> ThetaType -> Class -> [Type]
+                   -> TcS [Ct]
+-- Always return this class constraint,
+-- and expand its superclasses
+mk_superclasses_of rec_clss ev tvs theta cls tys
+  | loop_found = do { traceTcS "mk_superclasses_of: loop" (ppr cls <+> ppr tys)
+                    ; return [this_ct] }  -- cc_pend_sc of this_ct = True
+  | otherwise  = do { traceTcS "mk_superclasses_of" (vcat [ ppr cls <+> ppr tys
+                                                          , ppr (isCTupleClass cls)
+                                                          , ppr rec_clss
+                                                          ])
+                    ; sc_cts <- mk_strict_superclasses rec_clss' ev tvs theta cls tys
+                    ; return (this_ct : sc_cts) }
+                                   -- cc_pend_sc of this_ct = False
+  where
+    cls_nm     = className cls
+    loop_found = not (isCTupleClass cls) && cls_nm `elemNameSet` rec_clss
+                 -- Tuples never contribute to recursion, and can be nested
+    rec_clss'  = rec_clss `extendNameSet` cls_nm
+
+    this_ct | null tvs, null theta
+            = CDictCan { cc_ev = ev, cc_class = cls, cc_tyargs = tys
+                       , cc_pend_sc = loop_found }
+                 -- NB: If there is a loop, we cut off, so we have not
+                 --     added the superclasses, hence cc_pend_sc = True
+            | otherwise
+            = CQuantCan (QCI { qci_tvs = tvs, qci_pred = mkClassPred cls tys
+                             , qci_ev = ev
+                             , qci_pend_sc = loop_found })
+
 
 {-
 ************************************************************************
@@ -515,16 +585,8 @@ mk_strict_superclasses rec_clss ev cls tys
 canIrred :: CtEvidence -> TcS (StopOrContinue Ct)
 -- Precondition: ty not a tuple and no other evidence form
 canIrred ev
-  | EqPred eq_rel ty1 ty2 <- classifyPredType pred
-  = -- For insolubles (all of which are equalities, do /not/ flatten the arguments
-    -- In Trac #14350 doing so led entire-unnecessary and ridiculously large
-    -- type function expansion.  Instead, canEqNC just applies
-    -- the substitution to the predicate, and may do decomposition;
-    --    e.g. a ~ [a], where [G] a ~ [Int], can decompose
-    canEqNC ev eq_rel ty1 ty2
-
-  | otherwise
-  = do { traceTcS "can_pred" (text "IrredPred = " <+> ppr pred)
+  = do { let pred = ctEvPred ev
+       ; traceTcS "can_pred" (text "IrredPred = " <+> ppr pred)
        ; (xi,co) <- flatten FM_FlattenAll ev pred -- co :: xi ~ pred
        ; rewriteEvidence ev xi co `andWhenContinue` \ new_ev ->
     do { -- Re-classify, in case flattening has improved its shape
@@ -533,19 +595,172 @@ canIrred ev
            EqPred eq_rel ty1 ty2 -> canEqNC new_ev eq_rel ty1 ty2
            _                     -> continueWith $
                                     mkIrredCt new_ev } }
-  where
-    pred = ctEvPred ev
 
 canHole :: CtEvidence -> Hole -> TcS (StopOrContinue Ct)
 canHole ev hole
-  = do { let ty = ctEvPred ev
-       ; (xi,co) <- flatten FM_SubstOnly ev ty -- co :: xi ~ ty
+  = do { let pred = ctEvPred ev
+       ; (xi,co) <- flatten FM_SubstOnly ev pred -- co :: xi ~ pred
        ; rewriteEvidence ev xi co `andWhenContinue` \ new_ev ->
     do { updInertIrreds (`snocCts` (CHoleCan { cc_ev = new_ev
                                              , cc_hole = hole }))
        ; stopWith new_ev "Emit insoluble hole" } }
 
-{-
+
+{- *********************************************************************
+*                                                                      *
+*                      Quantified predicates
+*                                                                      *
+********************************************************************* -}
+
+{- Note [Quantified constraints]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The -XQuantifiedConstraints extension allows type-class contexts like this:
+
+  data Rose f x = Rose x (f (Rose f x))
+
+  instance (Eq a, forall b. Eq b => Eq (f b))
+        => Eq (Rose f a)  where
+    (Rose x1 rs1) == (Rose x2 rs2) = x1==x2 && rs1 == rs2
+
+Note the (forall b. Eq b => Eq (f b)) in the instance contexts.
+This quantified constraint is needed to solve the
+ [W] (Eq (f (Rose f x)))
+constraint which arises form the (==) definition.
+
+The wiki page is
+  https://ghc.haskell.org/trac/ghc/wiki/QuantifiedConstraints
+which in turn contains a link to the GHC Proposal where the change
+is specified, and a Haskell Symposium paper about it.
+
+We implement two main extensions to the design in the paper:
+
+ 1. We allow a variable in the instance head, e.g.
+      f :: forall m a. (forall b. m b) => D (m a)
+    Notice the 'm' in the head of the quantified constraint, not
+    a class.
+
+ 2. We suport superclasses to quantified constraints.
+    For example (contrived):
+      f :: (Ord b, forall b. Ord b => Ord (m b)) => m a -> m a -> Bool
+      f x y = x==y
+    Here we need (Eq (m a)); but the quantifed constraint deals only
+    with Ord.  But we can make it work by using its superclass.
+
+Here are the moving parts
+  * Language extension {-# LANGUAGE QuantifiedConstraints #-}
+    and add it to ghc-boot-th:GHC.LanguageExtensions.Type.Extension
+
+  * A new form of evidence, EvDFun, that is used to discharge
+    such wanted constraints
+
+  * checkValidType gets some changes to accept forall-constraints
+    only in the right places.
+
+  * Type.PredTree gets a new constructor ForAllPred, and
+    and classifyPredType analyses a PredType to decompose
+    the new forall-constraints
+
+  * TcSMonad.InertCans gets an extra field, inert_insts,
+    which holds all the Given forall-constraints.  In effect,
+    such Given constraints are like local instance decls.
+
+  * When trying to solve a class constraint, via
+    TcInteract.matchInstEnv, use the InstEnv from inert_insts
+    so that we include the local Given forall-constraints
+    in the lookup.  (See TcSMonad.getInstEnvs.)
+
+  * TcCanonical.canForAll deals with solving a
+    forall-constraint.  See
+       Note [Solving a Wanted forall-constraint]
+       Note [Solving a Wanted forall-constraint]
+
+  * We augment the kick-out code to kick out an inert
+    forall constraint if it can be rewritten by a new
+    type equality; see TcSMonad.kick_out_rewritable
+
+Note that a quantified constraint is never /inferred/
+(by TcSimplify.simplifyInfer).  A function can only have a
+quantified constraint in its type if it is given an explicit
+type signature.
+
+Note that we implement
+-}
+
+canForAll :: CtEvidence -> Bool -> TcS (StopOrContinue Ct)
+-- We have a constraint (forall as. blah => C tys)
+canForAll ev pend_sc
+  = do { -- First rewrite it to apply the current substitution
+         -- Do not bother with type-family reductions; we can't
+         -- do them under a forall anyway (c.f. Flatten.flatten_one
+         -- on a forall type)
+         let pred = ctEvPred ev
+       ; (xi,co) <- flatten FM_SubstOnly ev pred -- co :: xi ~ pred
+       ; rewriteEvidence ev xi co `andWhenContinue` \ new_ev ->
+
+    do { -- Now decompose into its pieces and solve it
+         -- (It takes a lot less code to flatten before decomposing.)
+       ; case classifyPredType (ctEvPred new_ev) of
+           ForAllPred tv_bndrs theta pred
+              -> solveForAll new_ev tv_bndrs theta pred pend_sc
+           _  -> pprPanic "canForAll" (ppr new_ev)
+    } }
+
+solveForAll :: CtEvidence -> [TyVarBinder] -> TcThetaType -> PredType -> Bool
+            -> TcS (StopOrContinue Ct)
+solveForAll ev tv_bndrs theta pred pend_sc
+  | CtWanted { ctev_dest = dest } <- ev
+  = -- See Note [Solving a Wanted forall-constraint]
+    do { let skol_info = QuantCtxtSkol
+             empty_subst = mkEmptyTCvSubst $ mkInScopeSet $
+                           tyCoVarsOfTypes (pred:theta) `delVarSetList` tvs
+       ; (subst, skol_tvs) <- tcInstSkolTyVarsX empty_subst tvs
+       ; given_ev_vars <- mapM newEvVar (substTheta subst theta)
+
+       ; (w_id, ev_binds)
+             <- checkConstraintsTcS skol_info skol_tvs given_ev_vars $
+                do { wanted_ev <- newWantedEvVarNC loc $
+                                  substTy subst pred
+                   ; return ( ctEvEvId wanted_ev
+                            , unitBag (mkNonCanonical wanted_ev)) }
+
+      ; setWantedEvTerm dest $
+        EvFun { et_tvs = skol_tvs, et_given = given_ev_vars
+              , et_binds = ev_binds, et_body = w_id }
+
+      ; stopWith ev "Wanted forall-constraint" }
+
+  | isGiven ev   -- See Note [Solving a Given forall-constraint]
+  = do { addInertForAll qci
+       ; stopWith ev "Given forall-constraint" }
+
+  | otherwise
+  = stopWith ev "Derived forall-constraint"
+  where
+    loc = ctEvLoc ev
+    tvs = binderVars tv_bndrs
+    qci = QCI { qci_ev = ev, qci_tvs = tvs
+              , qci_pred = pred, qci_pend_sc = pend_sc }
+
+{- Note [Solving a Wanted forall-constraint]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Solving a wanted forall (quantified) constraint
+  [W] df :: forall ab. (Eq a, Ord b) => C x a b
+is delightfully easy.   Just build an implication constraint
+    forall ab. (g1::Eq a, g2::Ord b) => [W] d :: C x a
+and discharge df thus:
+    df = /\ab. \g1 g2. let <binds> in d
+where <binds> is filled in by solving the implication constraint.
+All the machinery is to hand; there is little to do.
+
+Note [Solving a Given forall-constraint]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For a Given constraint
+  [G] df :: forall ab. (Eq a, Ord b) => C x a b
+we just add it to TcS's local InstEnv of known instances,
+via addInertForall.  Then, if we look up (C x Int Bool), say,
+we'll find a match in the InstEnv.
+
+
 ************************************************************************
 *                                                                      *
 *        Equalities
@@ -630,11 +845,14 @@ can_eq_nc' True _rdr_env _envs ev ReprEq ty1 _ ty2 _
   = canEqReflexive ev ReprEq ty1
 
 -- When working with ReprEq, unwrap newtypes.
-can_eq_nc' _flat rdr_env envs ev ReprEq ty1 _ ty2 ps_ty2
-  | Just stuff1 <- tcTopNormaliseNewTypeTF_maybe envs rdr_env ty1
+-- See Note [Unwrap newtypes first]
+can_eq_nc' _flat rdr_env envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2
+  | ReprEq <- eq_rel
+  , Just stuff1 <- tcTopNormaliseNewTypeTF_maybe envs rdr_env ty1
   = can_eq_newtype_nc ev NotSwapped ty1 stuff1 ty2 ps_ty2
-can_eq_nc' _flat rdr_env envs ev ReprEq ty1 ps_ty1 ty2 _
-  | Just stuff2 <- tcTopNormaliseNewTypeTF_maybe envs rdr_env ty2
+
+  | ReprEq <- eq_rel
+  , Just stuff2 <- tcTopNormaliseNewTypeTF_maybe envs rdr_env ty2
   = can_eq_newtype_nc ev IsSwapped  ty2 stuff2 ty1 ps_ty1
 
 -- Then, get rid of casts
@@ -657,7 +875,7 @@ can_eq_nc' True _rdr_env _envs ev eq_rel ty1 ps_ty1 (TyVarTy tv2) ps_ty2
 -- Literals
 can_eq_nc' _flat _rdr_env _envs ev eq_rel ty1@(LitTy l1) _ (LitTy l2) _
  | l1 == l2
-  = do { setEqIfWanted ev (mkReflCo (eqRelRole eq_rel) ty1)
+  = do { setEvBindIfWanted ev (evCoercion $ mkReflCo (eqRelRole eq_rel) ty1)
        ; stopWith ev "Equal LitTy" }
 
 -- Try to decompose type constructor applications
@@ -727,34 +945,30 @@ can_eq_nc_forall ev eq_rel s1 s2
             phi1' = substTy subst1 phi1
 
             -- Unify the kinds, extend the substitution
+            go :: [TcTyVar] -> TCvSubst -> [TyVarBinder]
+               -> TcS (TcCoercion, Cts)
             go (skol_tv:skol_tvs) subst (bndr2:bndrs2)
               = do { let tv2 = binderVar bndr2
-                   ; kind_co <- unifyWanted loc Nominal
-                                            (tyVarKind skol_tv)
-                                            (substTy subst (tyVarKind tv2))
+                   ; (kind_co, wanteds1) <- unify loc Nominal (tyVarKind skol_tv)
+                                                  (substTy subst (tyVarKind tv2))
                    ; let subst' = extendTvSubst subst tv2
                                        (mkCastTy (mkTyVarTy skol_tv) kind_co)
-                   ; co <- go skol_tvs subst' bndrs2
-                   ; return (mkForAllCo skol_tv kind_co co) }
+                   ; (co, wanteds2) <- go skol_tvs subst' bndrs2
+                   ; return ( mkTcForAllCo skol_tv kind_co co
+                            , wanteds1 `unionBags` wanteds2 ) }
 
             -- Done: unify phi1 ~ phi2
             go [] subst bndrs2
               = ASSERT( null bndrs2 )
-                unifyWanted loc (eqRelRole eq_rel)
-                            phi1' (substTy subst phi2)
+                unify loc (eqRelRole eq_rel) phi1' (substTy subst phi2)
 
             go _ _ _ = panic "cna_eq_nc_forall"  -- case (s:ss) []
 
             empty_subst2 = mkEmptyTCvSubst (getTCvInScope subst1)
 
-      ; (implic, _ev_binds, all_co) <- buildImplication skol_info skol_tvs [] $
-                                       go skol_tvs empty_subst2 bndrs2
-           -- We have nowhere to put these bindings
-           -- but TcSimplify.setImplicationStatus
-           -- checks that we don't actually use them
-           -- when skol_info = UnifyForAllSkol
+      ; all_co <- checkTvConstraintsTcS skol_info skol_tvs $
+                  go skol_tvs empty_subst2 bndrs2
 
-      ; updWorkListTcS (extendWorkListImplic implic)
       ; setWantedEq orig_dest all_co
       ; stopWith ev "Deferred polytype equality" } }
 
@@ -762,6 +976,17 @@ can_eq_nc_forall ev eq_rel s1 s2
  = do { traceTcS "Omitting decomposition of given polytype equality" $
         pprEq s1 s2    -- See Note [Do not decompose given polytype equalities]
       ; stopWith ev "Discard given polytype equality" }
+
+ where
+    unify :: CtLoc -> Role -> TcType -> TcType -> TcS (TcCoercion, Cts)
+    -- This version returns the wanted constraint rather
+    -- than putting it in the work list
+    unify loc role ty1 ty2
+      | ty1 `tcEqType` ty2
+      = return (mkTcReflCo role ty1, emptyBag)
+      | otherwise
+      = do { (wanted, co) <- newWantedEq loc role ty1 ty2
+           ; return (co, unitBag (mkNonCanonical wanted)) }
 
 ---------------------------------
 -- | Compare types for equality, while zonking as necessary. Gives up
@@ -900,7 +1125,26 @@ zonk_eq_types = go
     combine_rev f (Right tys) (Left elt) = Left (f <$> elt     <*> pure tys)
     combine_rev f (Right tys) (Right ty) = Right (f ty tys)
 
-{-
+{- See Note [Unwrap newtypes first]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider
+  newtype N m a = MkN (m a)
+Then N will get a conservative, Nominal role for its second paramter 'a',
+because it appears as an argument to the unknown 'm'. Now consider
+  [W] N Maybe a  ~R#  N Maybe b
+
+If we decompose, we'll get
+  [W] a ~N# b
+
+But if instead we unwrap we'll get
+  [W] Maybe a ~R# Maybe b
+which in turn gives us
+  [W] a ~R# b
+which is easier to satisfy.
+
+Bottom line: unwrap newtypes before decomposing them!
+c.f. Trac #9123 comment:52,53 for a compelling example.
+
 Note [Newtypes can blow the stack]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Suppose we have
@@ -1047,7 +1291,7 @@ canEqCast flat ev eq_rel swapped ty1 co1 ty2 ps_ty2
                                            , ppr ty1 <+> text "|>" <+> ppr co1
                                            , ppr ps_ty2 ])
        ; new_ev <- rewriteEqEvidence ev swapped ty1 ps_ty2
-                                     (mkTcReflCo role ty1 `mkTcCoherenceRightCo` co1)
+                                     (mkTcGReflRightCo role ty1 co1)
                                      (mkTcReflCo role ps_ty2)
        ; can_eq_nc flat new_ev eq_rel ty1 ty1 ty2 ps_ty2 }
   where
@@ -1488,19 +1732,18 @@ canCFunEqCan ev fn tys fsk
                       ; return (ev', fsk) }
               else do { (ev', new_co, new_fsk)
                           <- newFlattenSkolem flav (ctEvLoc ev) fn tys'
-                      ; case flav of
-                          Given -> return () -- nothing more to do.
-                                             -- NB: new_co is stored within ev',
-                                             -- and will be put in the flat_cache below
-                          _     -> do { let xi = mkTyVarTy new_fsk `mkCastTy` kind_co
-                                               -- sym lhs_co :: F tys ~ F tys'
-                                               -- new_co     :: F tys' ~ new_fsk
-                                               -- co         :: F tys ~ (new_fsk |> kind_co)
-                                            co = mkTcSymCo lhs_co `mkTcTransCo`
-                                                 (new_co `mkTcCoherenceRightCo` kind_co)
+                      ; let xi = mkTyVarTy new_fsk `mkCastTy` kind_co
+                               -- sym lhs_co :: F tys ~ F tys'
+                               -- new_co     :: F tys' ~ new_fsk
+                               -- co         :: F tys ~ (new_fsk |> kind_co)
+                            co = mkTcSymCo lhs_co `mkTcTransCo`
+                                 mkTcCoherenceRightCo Nominal
+                                                      (mkTyVarTy new_fsk)
+                                                      kind_co
+                                                      new_co
 
-                                      ; traceTcS "Discharging fmv due to hetero flattening" empty
-                                      ; dischargeFmv ev fsk co xi }
+                      ; traceTcS "Discharging fmv/fsk due to hetero flattening" (ppr ev)
+                      ; dischargeFunEq ev fsk co xi
                       ; return (ev', new_fsk) }
 
        ; extendFlatCache fn tys' (ctEvCoercion ev', mkTyVarTy fsk', ctEvFlavour ev')
@@ -1548,7 +1791,7 @@ canEqTyVar ev eq_rel swapped tv1 ps_ty1 xi2 ps_xi2
 
                        new_rhs     = xi2 `mkCastTy` rhs_kind_co
                        ps_rhs      = ps_xi2 `mkCastTy` rhs_kind_co
-                       rhs_co      = mkTcReflCo role xi2 `mkTcCoherenceLeftCo` rhs_kind_co
+                       rhs_co      = mkTcGReflLeftCo role xi2 rhs_kind_co
 
                  ; new_ev <- rewriteEqEvidence ev swapped xi1 new_rhs
                                                (mkTcReflCo role xi1) rhs_co
@@ -1563,8 +1806,8 @@ canEqTyVar ev eq_rel swapped tv1 ps_ty1 xi2 ps_xi2
              new_rhs = xi2 `mkCastTy` sym_k2_co  -- :: flat_k2
              ps_rhs  = ps_xi2 `mkCastTy` sym_k2_co
 
-             lhs_co = mkReflCo role xi1 `mkTcCoherenceLeftCo` sym_k1_co
-             rhs_co = mkReflCo role xi2 `mkTcCoherenceLeftCo` sym_k2_co
+             lhs_co = mkTcGReflLeftCo role xi1 sym_k1_co
+             rhs_co = mkTcGReflLeftCo role xi2 sym_k2_co
                -- lhs_co :: (xi1 |> sym k1_co) ~ xi1
                -- rhs_co :: (xi2 |> sym k2_co) ~ xi2
 
@@ -1593,27 +1836,23 @@ canEqTyVarHetero ev eq_rel tv1 co1 ki1 ps_tv1 xi2 ki2 ps_xi2
   | CtGiven { ctev_evar = evar } <- ev
     -- unswapped: tm :: (lhs :: ki1) ~ (rhs :: ki2)
     -- swapped  : tm :: (rhs :: ki2) ~ (lhs :: ki1)
-  = do { kind_ev_id <- newBoundEvVarId kind_pty
-                                       (evCoercion $ mkTcKindCo $ mkTcCoVarCo evar)
-           -- kind_ev_id :: (ki1 :: *) ~ (ki2 :: *)   (whether swapped or not)
-       ; let kind_ev = CtGiven { ctev_pred = kind_pty
-                               , ctev_evar = kind_ev_id
-                               , ctev_loc  = kind_loc }
+  = do { let kind_co = mkTcKindCo (mkTcCoVarCo evar)
+       ; kind_ev <- newGivenEvVar kind_loc (kind_pty, evCoercion kind_co)
+       ; let  -- kind_ev :: (ki1 :: *) ~ (ki2 :: *)   (whether swapped or not)
               -- co1     :: kind(tv1) ~N ki1
               -- homo_co :: ki2 ~N kind(tv1)
-             homo_co = mkTcSymCo (mkCoVarCo kind_ev_id) `mkTcTransCo` mkTcSymCo co1
-
+             homo_co = mkTcSymCo (ctEvCoercion kind_ev) `mkTcTransCo` mkTcSymCo co1
              rhs'    = mkCastTy xi2 homo_co     -- :: kind(tv1)
              ps_rhs' = mkCastTy ps_xi2 homo_co  -- :: kind(tv1)
-             rhs_co  = mkReflCo role xi2 `mkTcCoherenceLeftCo` homo_co
+             rhs_co  = mkTcGReflLeftCo role xi2 homo_co
                -- rhs_co :: (xi2 |> homo_co :: kind(tv1)) ~ xi2
 
              lhs'   = mkTyVarTy tv1       -- :: kind(tv1)
-             lhs_co = mkReflCo role lhs' `mkTcCoherenceRightCo` co1
+             lhs_co = mkTcGReflRightCo role lhs' co1
                -- lhs_co :: (tv1 :: kind(tv1)) ~ (tv1 |> co1 :: ki1)
 
        ; traceTcS "Hetero equality gives rise to given kind equality"
-           (ppr kind_ev_id <+> dcolon <+> ppr kind_pty)
+           (ppr kind_ev <+> dcolon <+> ppr kind_pty)
        ; emitWorkNC [kind_ev]
        ; type_ev <- rewriteEqEvidence ev NotSwapped lhs' rhs' lhs_co rhs_co
        ; canEqTyVarHomo type_ev eq_rel NotSwapped tv1 ps_tv1 rhs' ps_rhs' }
@@ -1659,10 +1898,10 @@ canEqTyVarHomo ev eq_rel swapped tv1 ps_ty1 ty2 _
              sym_co2 = mkTcSymCo co2
              ty1     = mkTyVarTy tv1
              new_lhs = ty1 `mkCastTy` sym_co2
-             lhs_co  = mkReflCo role ty1 `mkTcCoherenceLeftCo` sym_co2
+             lhs_co  = mkTcGReflLeftCo role ty1 sym_co2
 
              new_rhs = mkTyVarTy tv2
-             rhs_co  = mkReflCo role new_rhs `mkTcCoherenceRightCo` co2
+             rhs_co  = mkTcGReflRightCo role new_rhs co2
 
        ; new_ev <- rewriteEqEvidence ev swapped new_lhs new_rhs lhs_co rhs_co
 
@@ -1756,24 +1995,6 @@ canEqTyVarTyVar, are these
  * If one is a flatten-skolem, put it on the left so that it is
    substituted out  Note [Elminate flat-skols]
         fsk ~ a
-
-Note [Eliminate flat-skols]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Suppose we have  [G] Num (F [a])
-then we flatten to
-     [G] Num fsk
-     [G] F [a] ~ fsk
-where fsk is a flatten-skolem (FlatSkolTv). Suppose we have
-      type instance F [a] = a
-then we'll reduce the second constraint to
-     [G] a ~ fsk
-and then replace all uses of 'a' with fsk.  That's bad because
-in error messages intead of saying 'a' we'll say (F [a]).  In all
-places, including those where the programmer wrote 'a' in the first
-place.  Very confusing!  See Trac #7862.
-
-Solution: re-orient a~fsk to fsk~a, so that we preferentially eliminate
-the fsk.
 
 Note [Equalities with incompatible kinds]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1993,8 +2214,8 @@ rewriteEvidence ev@(CtWanted { ctev_dest = dest
   = do { mb_new_ev <- newWanted loc new_pred
        ; MASSERT( tcCoercionRole co == ctEvRole ev )
        ; setWantedEvTerm dest
-            (EvExpr $ mkEvCast (getEvExpr mb_new_ev)
-                               (tcDowngradeRole Representational (ctEvRole ev) co))
+            (mkEvCast (getEvExpr mb_new_ev)
+                      (tcDowngradeRole Representational (ctEvRole ev) co))
        ; case mb_new_ev of
             Fresh  new_ev -> continueWith new_ev
             Cached _      -> stopWith ev "Cached wanted" }

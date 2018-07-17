@@ -37,10 +37,6 @@ module TcMType (
   tauifyExpType, inferResultToType,
 
   --------------------------------
-  -- Creating fresh type variables for pm checking
-  genInstSkolTyVarsX,
-
-  --------------------------------
   -- Creating new evidence variables
   newEvVar, newEvVars, newDict,
   newWanted, newWanteds, cloneWanted, cloneWC,
@@ -65,7 +61,7 @@ module TcMType (
 
   --------------------------------
   -- Zonking and tidying
-  zonkTidyTcType, zonkTidyOrigin,
+  zonkTidyTcType, zonkTidyTcTypes, zonkTidyOrigin,
   tidyEvVar, tidyCt, tidySkolemInfo,
   skolemiseRuntimeUnk,
   zonkTcTyVar, zonkTcTyVars,
@@ -205,11 +201,11 @@ cloneWC wc@(WC { wc_simple = simples, wc_impl = implics })
            ; return (implic { ic_wanted = inner_wanted' }) }
 
 -- | Emits a new Wanted. Deals with both equalities and non-equalities.
-emitWanted :: CtOrigin -> TcPredType -> TcM EvExpr
+emitWanted :: CtOrigin -> TcPredType -> TcM EvTerm
 emitWanted origin pty
   = do { ev <- newWanted origin Nothing pty
        ; emitSimple $ mkNonCanonical ev
-       ; return $ ctEvExpr ev }
+       ; return $ ctEvTerm ev }
 
 -- | Emits a new equality constraint
 emitWantedEq :: CtOrigin -> TypeOrKind -> Role -> TcType -> TcType -> TcM Coercion
@@ -247,8 +243,9 @@ newDict cls tys
 predTypeOccName :: PredType -> OccName
 predTypeOccName ty = case classifyPredType ty of
     ClassPred cls _ -> mkDictOcc (getOccName cls)
-    EqPred _ _ _    -> mkVarOccFS (fsLit "co")
-    IrredPred _     -> mkVarOccFS (fsLit "irred")
+    EqPred {}       -> mkVarOccFS (fsLit "co")
+    IrredPred {}    -> mkVarOccFS (fsLit "irred")
+    ForAllPred {}   -> mkVarOccFS (fsLit "df")
 
 {-
 ************************************************************************
@@ -512,13 +509,24 @@ tcInstSkolTyVars' overlappable subst tvs
        ; instSkolTyCoVarsX (mkTcSkolTyVar lvl loc overlappable) subst tvs }
 
 mkTcSkolTyVar :: TcLevel -> SrcSpan -> Bool -> TcTyCoVarMaker gbl lcl
-mkTcSkolTyVar lvl loc overlappable old_name kind
+-- Allocates skolems whose level is ONE GREATER THAN the passed-in tc_lvl
+-- See Note [Skolem level allocation]
+mkTcSkolTyVar tc_lvl loc overlappable old_name kind
   = do { uniq <- newUnique
        ; let name = mkInternalName uniq (getOccName old_name) loc
        ; return (mkTcTyVar name kind details) }
   where
-    details = SkolemTv (pushTcLevel lvl) overlappable
-              -- NB: skolems bump the level
+    details = SkolemTv (pushTcLevel tc_lvl) overlappable
+              -- pushTcLevel: see Note [Skolem level allocation]
+
+{- Note [Skolem level allocation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We generally allocate skolems /before/ calling pushLevelAndCaptureConstraints.
+So we want their level to the level of the soon-to-be-created implication,
+which has a level one higher than the current level.  Hence the pushTcLevel.
+It feels like a slight hack.  Applies also to vanillaSkolemTv.
+
+-}
 
 ------------------
 freshenTyVarBndrs :: [TyVar] -> TcRnIf gbl lcl (TCvSubst, [TyVar])
@@ -569,9 +577,10 @@ newFskTyVar :: TcType -> TcM TcTyVar
 newFskTyVar fam_ty
   = do { uniq <- newUnique
        ; ref  <- newMutVar Flexi
+       ; tclvl <- getTcLevel
        ; let details = MetaTv { mtv_info  = FlatSkolTv
                               , mtv_ref   = ref
-                              , mtv_tclvl = fmvTcLevel }
+                              , mtv_tclvl = tclvl }
              name = mkMetaTyVarName uniq (fsLit "fsk")
        ; return (mkTcTyVar name (typeKind fam_ty) details) }
 
@@ -632,9 +641,10 @@ newFmvTyVar :: TcType -> TcM TcTyVar
 newFmvTyVar fam_ty
   = do { uniq <- newUnique
        ; ref  <- newMutVar Flexi
+       ; tclvl <- getTcLevel
        ; let details = MetaTv { mtv_info  = FlatMetaTv
                               , mtv_ref   = ref
-                              , mtv_tclvl = fmvTcLevel }
+                              , mtv_tclvl = tclvl }
              name = mkMetaTyVarName uniq (fsLit "s")
        ; return (mkTcTyVar name (typeKind fam_ty) details) }
 
@@ -749,8 +759,7 @@ writeMetaTyVarRef tyvar ref ty
     tv_lvl = tcTyVarLevel tyvar
     ty_lvl = tcTypeLevel ty
 
-    level_check_ok = isFlattenTyVar tyvar
-                  || not (ty_lvl `strictlyDeeperThan` tv_lvl)
+    level_check_ok  = not (ty_lvl `strictlyDeeperThan` tv_lvl)
     level_check_msg = ppr ty_lvl $$ ppr tv_lvl $$ ppr tyvar $$ ppr ty
 
     double_upd_msg details = hang (text "Double update of meta tyvar")
@@ -772,14 +781,6 @@ See Note [TcLevel assignment] in TcType.
 % Generating fresh variables for pattern match check
 -}
 
--- UNINSTANTIATED VERSION OF tcInstSkolTyCoVars
-genInstSkolTyVarsX :: SrcSpan -> TCvSubst -> [TyVar]
-                   -> TcRnIf gbl lcl (TCvSubst, [TcTyVar])
--- Precondition: tyvars should be scoping-ordered
--- see Note [Kind substitution when instantiating]
--- Get the location from the monad; this is a complete freshening operation
-genInstSkolTyVarsX loc subst tvs
-  = instSkolTyCoVarsX (mkTcSkolTyVar topTcLevel loc False) subst tvs
 
 {-
 ************************************************************************
@@ -906,7 +907,7 @@ new_meta_tv_x info subst tv
       -- is not yet fixed so leaving as unchecked for now.
       -- OLD NOTE:
       -- Unchecked because we call newMetaTyVarX from
-      -- tcInstBinder, which is called from tc_infer_args
+      -- tcInstTyBinder, which is called from tcInferApps
       -- which does not yet take enough trouble to ensure
       -- the in-scope set is right; e.g. Trac #12785 trips
       -- if we use substTy here
@@ -1101,7 +1102,7 @@ defaultTyVar default_kind tv
        -- It takes an (unconstrained) meta tyvar and defaults it.
        -- Works only on vars of type *; for other kinds, it issues an error.
     default_kind_var kv
-      | isStarKind (tyVarKind kv)
+      | isLiftedTypeKind (tyVarKind kv)
       = do { traceTc "Defaulting a kind var to *" (ppr kv)
            ; writeMetaTyVar kv liftedTypeKind }
       | otherwise
@@ -1473,7 +1474,7 @@ zonkCt ct
   = ASSERT( not (isCFunEqCan ct) )
   -- We do not expect to see any CFunEqCans, because zonkCt is only called on
   -- unflattened constraints.
-    do { fl' <- zonkCtEvidence (cc_ev ct)
+    do { fl' <- zonkCtEvidence (ctEvidence ct)
        ; return (mkNonCanonical fl') }
 
 zonkCtEvidence :: CtEvidence -> TcM CtEvidence
@@ -1619,6 +1620,13 @@ zonkSigTyVarPairs prs
 zonkTidyTcType :: TidyEnv -> TcType -> TcM (TidyEnv, TcType)
 zonkTidyTcType env ty = do { ty' <- zonkTcType ty
                            ; return (tidyOpenType env ty') }
+
+zonkTidyTcTypes :: TidyEnv -> [TcType] -> TcM (TidyEnv, [TcType])
+zonkTidyTcTypes = zonkTidyTcTypes' []
+  where zonkTidyTcTypes' zs env [] = return (env, reverse zs)
+        zonkTidyTcTypes' zs env (ty:tys)
+          = do { (env', ty') <- zonkTidyTcType env ty
+               ; zonkTidyTcTypes' (ty':zs) env' tys }
 
 zonkTidyOrigin :: TidyEnv -> CtOrigin -> TcM (TidyEnv, CtOrigin)
 zonkTidyOrigin env (GivenOrigin skol_info)

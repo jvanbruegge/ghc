@@ -33,6 +33,8 @@ generally likely to indicate bugs in your program. These are:
     * :ghc-flag:`-Wunsupported-llvm-version`
     * :ghc-flag:`-Wtabs`
     * :ghc-flag:`-Wunrecognised-warning-flags`
+    * :ghc-flag:`-Winaccessible-code`
+    * :ghc-flag:`-Wstar-binder`
 
 The following flags are simple ways to select standard "packages" of warnings:
 
@@ -108,6 +110,7 @@ The following flags are simple ways to select standard "packages" of warnings:
         * :ghc-flag:`-Wmissing-monadfail-instances`
         * :ghc-flag:`-Wsemigroup`
         * :ghc-flag:`-Wnoncanonical-monoid-instances`
+        * :ghc-flag:`-Wimplicit-kind-vars`
 
 .. ghc-flag:: -Wno-compat
     :shortdesc: Disables all warnings enabled by :ghc-flag:`-Wcompat`.
@@ -149,6 +152,9 @@ to abort.
     Makes a specific warning into a fatal error. The warning will be enabled if
     it hasn't been enabled yet.
 
+    ``-Werror=compat`` has the same effect as ``-Werror=...`` for each warning
+    flag in the :ghc-flag:`-Wcompat` option group.
+
 .. ghc-flag:: -Wwarn
     :shortdesc: make warnings non-fatal
     :type: dynamic
@@ -169,6 +175,9 @@ to abort.
 
     Note that it doesn't fully negate the effects of ``-Werror=<wflag>`` - the
     warning will still be enabled.
+
+    ``-Wwarn=compat`` has the same effect as ``-Wwarn=...`` for each warning
+    flag in the :ghc-flag:`-Wcompat` option group.
 
 When a warning is emitted, the specific warning flag which controls
 it is shown.
@@ -401,22 +410,6 @@ of ``-W(no-)*``.
     An alias for :ghc-flag:`-Wwarnings-deprecations`.
 
     This option is on by default.
-
-.. ghc-flag:: -Wamp
-    :shortdesc: *(deprecated)* warn on definitions conflicting with the
-        Applicative-Monad Proposal (AMP)
-    :type: dynamic
-    :reverse: -Wno-amp
-    :category:
-
-    .. index::
-       single: AMP
-       single: Applicative-Monad Proposal
-
-    This option is deprecated.
-
-    Caused a warning to be emitted when a definition was in conflict with
-    the AMP (Applicative-Monad proosal).
 
 .. ghc-flag:: -Wnoncanonical-monad-instances
     :shortdesc: warn when ``Applicative`` or ``Monad`` instances have
@@ -685,7 +678,7 @@ of ``-W(no-)*``.
     Similar warnings are given for a redundant constraint in an instance
     declaration.
 
-    When turning on, you can suppress it on a per-module basis with 
+    When turning on, you can suppress it on a per-module basis with
     :ghc-flag:`-Wno-redundant-constraints <-Wredundant-constraints>`.
     Occasionally you may specifically want a function to have a more
     constrained signature than necessary, perhaps to leave yourself
@@ -766,6 +759,58 @@ of ``-W(no-)*``.
     being compiled).
 
     This warning is off by default.
+
+.. ghc-flag:: -Wimplicit-kind-vars
+    :shortdesc: warn when kind variables are brought into scope implicitly despite
+        the "forall-or-nothing" rule
+    :type: dynamic
+    :reverse: -Wno-implicit-kind-vars
+    :category:
+
+    :since: 8.6
+
+    `GHC proposal #24
+    <https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0024-no-kind-vars.rst>`__
+    prescribes to treat kind variables and type variables identically in
+    ``forall``, removing the legacy distinction between them.
+
+    Consider the following examples: ::
+
+        f :: Proxy a -> Proxy b -> ()
+        g :: forall a b. Proxy a -> Proxy b -> ()
+
+    ``f`` does not use an explicit ``forall``, so type variables ``a`` and ``b``
+    are brought into scope implicitly. ``g`` quantifies both ``a`` and ``b``
+    explicitly. Both ``f`` and ``g`` work today and will continue to work in the
+    future because they adhere to the "forall-or-nothing" rule: either all type
+    variables in a function definition are introduced explicitly or implicitly,
+    there is no middle ground.
+
+    A violation of the "forall-or-nothing" rule looks like this: ::
+
+        m :: forall a. Proxy a -> Proxy b -> ()
+
+    ``m`` does not introduce one of the variables, ``b``, and thus is rejected.
+
+    However, consider the following example: ::
+
+        n :: forall a. Proxy (a :: k) -> ()
+
+    While ``n`` uses ``k`` without introducing it and thus violates the rule, it
+    is currently accepted. This is because ``k`` in ``n`` is considered a kind
+    variable, as it occurs in a kind signature. In reality, the line between
+    type variables and kind variables is blurry, as the following example
+    demonstrates: ::
+
+        kindOf :: forall a. Proxy (a :: k) -> Proxy k
+
+    In ``kindOf``, the ``k`` variable is used both in a kind position and a type
+    position. Currently, ``kindOf`` happens to be accepted as well.
+
+    In a future release of GHC, both ``n`` and ``kindOf`` will be rejected per
+    the "forall-or-nothing" rule. This warning, being part of the
+    :ghc-flag:`-Wcompat` option group, allows to detect this before the actual
+    breaking change takes place.
 
 .. ghc-flag:: -Wincomplete-patterns
     :shortdesc: warn when a pattern match could fail
@@ -1087,6 +1132,73 @@ of ``-W(no-)*``.
     where the last pattern match in ``f`` won't ever be reached, as the
     second pattern overlaps it. More often than not, redundant patterns
     is a programmer mistake/error, so this option is enabled by default.
+
+.. ghc-flag:: -Winaccessible-code
+    :shortdesc: warn about inaccessible code
+    :type: dynamic
+    :reverse: -Wno-inaccessible-code
+    :category:
+
+    .. index::
+       single: inaccessible code, warning
+       single: inaccessible
+
+    By default, the compiler will warn you if types make a branch inaccessible.
+    This generally requires GADTs or similar extensions.
+
+    Take, for example, the following program ::
+
+        {-# LANGUAGE GADTs #-}
+
+        data Foo a where
+         Foo1 :: Foo Char
+         Foo2 :: Foo Int
+
+        data TyEquality a b where
+                Refl :: TyEquality a a
+
+        checkTEQ :: Foo t -> Foo u -> Maybe (TyEquality t u)
+        checkTEQ x y = error "unimportant"
+
+        step2 :: Bool
+        step2 = case checkTEQ Foo1 Foo2 of
+                 Just Refl -> True -- Inaccessible code
+                 Nothing -> False
+
+    The ``Just Refl`` case in ``step2`` is inaccessible, because in order for
+    ``checkTEQ`` to be able to produce a ``Just``, ``t ~ u`` must hold, but
+    since we're passing ``Foo1`` and ``Foo2`` here, it follows that ``t ~
+    Char``, and ``u ~ Int``, and thus ``t ~ u`` cannot hold.
+
+.. ghc-flag:: -Wstar-binder
+     :shortdesc: warn about binding the ``(*)`` type operator despite
+         :ghc-flag:`-XStarIsType`
+     :type: dynamic
+     :reverse: -Wno-star-binder
+
+     Under :ghc-flag:`-XStarIsType`, a ``*`` in types is not an operator nor
+     even a name, it is special syntax that stands for ``Data.Kind.Type``. This
+     means that an expression like ``Either * Char`` is parsed as ``Either (*)
+     Char`` and not ``(*) Either Char``.
+
+     In binding positions, we have similar parsing rules. Consider the following
+     example ::
+
+         {-# LANGUAGE TypeOperators, TypeFamilies, StarIsType #-}
+
+         type family a + b
+         type family a * b
+
+     While ``a + b`` is parsed as ``(+) a b`` and becomes a binding position for
+     the ``(+)`` type operator, ``a * b`` is parsed as ``a (*) b`` and is rejected.
+
+     As a workaround, we allow to bind ``(*)`` in prefix form::
+
+         type family (*) a b
+
+     This is a rather fragile arrangement, as generally a programmer expects
+     ``(*) a b`` to be equivalent to ``a * b``. With :ghc-flag:`-Wstar-binder`
+     we warn when this special treatment of ``(*)`` takes place.
 
 .. ghc-flag:: -Wsimplifiable-class-constraints
     :shortdesc: 2arn about class constraints in a type signature that can

@@ -53,7 +53,7 @@ import PrelNames ( eqPrimTyConKey )
 import UniqDFM
 import Outputable
 import Maybes
-import TrieMap
+import CoreMap
 import Unique
 import Util
 import Var
@@ -1205,7 +1205,7 @@ Type) pairs.
 
 We also benefit because we can piggyback on the liftCoSubstVarBndr function to
 deal with binders. However, I had to modify that function to work with this
-application. Thus, we now have liftCoSubstVarBndrCallback, which takes
+application. Thus, we now have liftCoSubstVarBndrUsing, which takes
 a function used to process the kind of the binder. We don't wish
 to lift the kind, but instead normalise it. So, we pass in a callback function
 that processes the kind of the binder.
@@ -1341,15 +1341,15 @@ normaliseType env role ty
   = initNormM env role (tyCoVarsOfType ty) $ normalise_type ty
 
 normalise_type :: Type                     -- old type
-               -> NormM (Coercion, Type)   -- (coercion,new type), where
-                                         -- co :: old-type ~ new_type
+               -> NormM (Coercion, Type)   -- (coercion, new type), where
+                                           -- co :: old-type ~ new_type
 -- Normalise the input type, by eliminating *all* type-function redexes
 -- but *not* newtypes (which are visible to the programmer)
 -- Returns with Refl if nothing happens
 -- Does nothing to newtypes
 -- The returned coercion *must* be *homogeneous*
 -- See Note [Normalising types]
--- Try to not to disturb type synonyms if possible
+-- Try not to disturb type synonyms if possible
 
 normalise_type ty
   = go ty
@@ -1376,7 +1376,8 @@ normalise_type ty
       = do { (nco, nty) <- go ty
            ; lc <- getLC
            ; let co' = substRightCo lc co
-           ; return (castCoercionKind nco co co', mkCastTy nty co') }
+           ; return (castCoercionKind nco Nominal ty nty co co'
+                    , mkCastTy nty co') }
     go (CoercionTy co)
       = do { lc <- getLC
            ; r <- getRole
@@ -1401,7 +1402,7 @@ normalise_tyvar_bndr tv
   = do { lc1 <- getLC
        ; env <- getEnv
        ; let callback lc ki = runNormM (normalise_type ki) env lc Nominal
-       ; return $ liftCoSubstVarBndrCallback callback lc1 tv }
+       ; return $ liftCoSubstVarBndrUsing callback lc1 tv }
 
 -- | a monad for the normalisation functions, reading 'FamInstEnvs',
 -- a 'LiftingContext', and a 'Role'.
@@ -1623,7 +1624,11 @@ allTyVarsInTy = go
     go (CastTy ty co)    = go ty `unionVarSet` go_co co
     go (CoercionTy co)   = go_co co
 
-    go_co (Refl _ ty)           = go ty
+    go_mco MRefl    = emptyVarSet
+    go_mco (MCo co) = go_co co
+
+    go_co (Refl ty)             = go ty
+    go_co (GRefl _ ty mco)      = go ty `unionVarSet` go_mco mco
     go_co (TyConAppCo _ _ args) = go_cos args
     go_co (AppCo co arg)        = go_co co `unionVarSet` go_co arg
     go_co (ForAllCo tv h co)
@@ -1638,7 +1643,6 @@ allTyVarsInTy = go
     go_co (NthCo _ _ co)        = go_co co
     go_co (LRCo _ co)           = go_co co
     go_co (InstCo co arg)       = go_co co `unionVarSet` go_co arg
-    go_co (CoherenceCo c1 c2)   = go_co c1 `unionVarSet` go_co c2
     go_co (KindCo co)           = go_co co
     go_co (SubCo co)            = go_co co
     go_co (AxiomRuleCo _ cs)    = go_cos cs

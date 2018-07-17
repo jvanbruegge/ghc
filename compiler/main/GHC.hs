@@ -132,6 +132,9 @@ module GHC (
         ForeignHValue,
         compileExprRemote, compileParsedExprRemote,
 
+        -- ** Docs
+        getDocs, GetDocsFailure(..),
+
         -- ** Other
         runTcInteractive,   -- Desired by some clients (Trac #8878)
         isStmt, hasImport, isImport, isDecl,
@@ -472,7 +475,6 @@ withCleanupSession ghc = ghc `gfinally` cleanup
           cleanTempFiles dflags
           cleanTempDirs dflags
           stopIServ hsc_env -- shut down the IServ
-          log_finaliser dflags dflags
           --  exceptions will be blocked while we clean the temporary files,
           -- so there shouldn't be any difficulty if we receive further
           -- signals.
@@ -493,8 +495,8 @@ initGhcMonad :: GhcMonad m => Maybe FilePath -> m ()
 initGhcMonad mb_top_dir
   = do { env <- liftIO $
                 do { mySettings <- initSysTools mb_top_dir
-                   ; myLlvmTargets <- initLlvmTargets mb_top_dir
-                   ; dflags <- initDynFlags (defaultDynFlags mySettings myLlvmTargets)
+                   ; myLlvmConfig <- initLlvmConfig mb_top_dir
+                   ; dflags <- initDynFlags (defaultDynFlags mySettings myLlvmConfig)
                    ; checkBrokenTablesNextToCode dflags
                    ; setUnsafeGlobalDynFlags dflags
                       -- c.f. DynFlags.parseDynamicFlagsFull, which
@@ -592,12 +594,11 @@ setProgramDynFlags dflags = setProgramDynFlags_ True dflags
 -- | Set the action taken when the compiler produces a message.  This
 -- can also be accomplished using 'setProgramDynFlags', but using
 -- 'setLogAction' avoids invalidating the cached module graph.
-setLogAction :: GhcMonad m => LogAction -> LogFinaliser -> m ()
-setLogAction action finaliser = do
+setLogAction :: GhcMonad m => LogAction -> m ()
+setLogAction action = do
   dflags' <- getProgramDynFlags
   void $ setProgramDynFlags_ False $
-    dflags' { log_action = action
-            , log_finaliser = finaliser }
+    dflags' { log_action = action }
 
 setProgramDynFlags_ :: GhcMonad m => Bool -> DynFlags -> m [InstalledUnitId]
 setProgramDynFlags_ invalidate_needed dflags = do

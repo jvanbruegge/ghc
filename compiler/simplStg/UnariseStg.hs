@@ -203,15 +203,15 @@ import CoreSyn
 import DataCon
 import FastString (FastString, mkFastString)
 import Id
-import Literal (Literal (..), literalType)
-import MkCore (aBSENT_ERROR_ID)
+import Literal
+import MkCore (aBSENT_SUM_FIELD_ERROR_ID)
 import MkId (voidPrimId, voidArgId)
 import MonadUtils (mapAccumLM)
 import Outputable
 import RepType
 import StgSyn
 import Type
-import TysPrim (intPrimTy)
+import TysPrim (intPrimTy,wordPrimTy,word64PrimTy)
 import TysWiredIn
 import UniqSupply
 import Util
@@ -478,7 +478,7 @@ unariseSumAlt rho _ (DEFAULT, _, e)
 unariseSumAlt rho args (DataAlt sumCon, bs, e)
   = do let rho' = mapSumIdBinders bs args rho
        e' <- unariseExpr rho' e
-       return ( LitAlt (MachInt (fromIntegral (dataConTag sumCon))), [], e' )
+       return ( LitAlt (LitNumber LitNumInt (fromIntegral (dataConTag sumCon)) intPrimTy), [], e' )
 
 unariseSumAlt _ scrt alt
   = pprPanic "unariseSumAlt" (ppr scrt $$ ppr alt)
@@ -564,7 +564,7 @@ mkUbxSum dc ty_args args0
       tag = dataConTag dc
 
       layout'  = layoutUbxSum sum_slots (mapMaybe (typeSlotTy . stgArgType) args0)
-      tag_arg  = StgLitArg (MachInt (fromIntegral tag))
+      tag_arg  = StgLitArg (LitNumber LitNumInt (fromIntegral tag) intPrimTy)
       arg_idxs = IM.fromList (zipEqual "mkUbxSum" layout' args0)
 
       mkTupArgs :: Int -> [SlotTy] -> IM.IntMap StgArg -> [StgArg]
@@ -577,9 +577,10 @@ mkUbxSum dc ty_args args0
         = slotRubbishArg slot : mkTupArgs (arg_idx + 1) slots_left arg_map
 
       slotRubbishArg :: SlotTy -> StgArg
-      slotRubbishArg PtrSlot    = StgVarArg aBSENT_ERROR_ID
-      slotRubbishArg WordSlot   = StgLitArg (MachWord 0)
-      slotRubbishArg Word64Slot = StgLitArg (MachWord64 0)
+      slotRubbishArg PtrSlot    = StgVarArg aBSENT_SUM_FIELD_ERROR_ID
+                         -- See Note [aBSENT_SUM_FIELD_ERROR_ID] in MkCore
+      slotRubbishArg WordSlot   = StgLitArg (LitNumber LitNumWord 0 wordPrimTy)
+      slotRubbishArg Word64Slot = StgLitArg (LitNumber LitNumWord64 0 word64PrimTy)
       slotRubbishArg FloatSlot  = StgLitArg (MachFloat 0)
       slotRubbishArg DoubleSlot = StgLitArg (MachDouble 0)
     in

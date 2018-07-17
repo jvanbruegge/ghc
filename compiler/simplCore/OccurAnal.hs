@@ -62,9 +62,9 @@ Here's the externally-callable interface:
 occurAnalysePgm :: Module         -- Used only in debug output
                 -> (Id -> Bool)         -- Active unfoldings
                 -> (Activation -> Bool) -- Active rules
-                -> [CoreRule] -> [CoreVect] -> VarSet
+                -> [CoreRule]
                 -> CoreProgram -> CoreProgram
-occurAnalysePgm this_mod active_unf active_rule imp_rules vects vectVars binds
+occurAnalysePgm this_mod active_unf active_rule imp_rules binds
   | isEmptyDetails final_usage
   = occ_anald_binds
 
@@ -86,12 +86,8 @@ occurAnalysePgm this_mod active_unf active_rule imp_rules vects vectVars binds
           -- we can easily create an infinite loop (Trac #9583 is an example)
 
     initial_uds = addManyOccsSet emptyDetails
-                            (rulesFreeVars imp_rules `unionVarSet`
-                             vectsFreeVars vects `unionVarSet`
-                             vectVars)
-    -- The RULES and VECTORISE declarations keep things alive! (For VECTORISE declarations,
-    -- we only get them *until* the vectoriser runs. Afterwards, these dependencies are
-    -- reflected in 'vectors' — see Note [Vectorisation declarations and occurrences].)
+                            (rulesFreeVars imp_rules)
+    -- The RULES declarations keep things alive!
 
     -- Note [Preventing loops due to imported functions rules]
     imp_rule_edges = foldr (plusVarEnv_C unionVarSet) emptyVarEnv
@@ -772,7 +768,7 @@ occAnalNonRecBind env lvl imp_rule_edges binder rhs body_usage
   = (body_usage, [])
 
   | otherwise                   -- It's mentioned in the body
-  = (body_usage' +++ rhs_usage', [NonRec tagged_binder rhs'])
+  = (body_usage' `andUDs` rhs_usage', [NonRec tagged_binder rhs'])
   where
     (body_usage', tagged_binder) = tagNonRecBinder lvl body_usage binder
     mb_join_arity = willBeJoinId_maybe tagged_binder
@@ -787,16 +783,17 @@ occAnalNonRecBind env lvl imp_rule_edges binder rhs body_usage
     -- Unfoldings
     -- See Note [Unfoldings and join points]
     rhs_usage2 = case occAnalUnfolding env NonRecursive binder of
-                   Just unf_usage -> rhs_usage1 +++ unf_usage
+                   Just unf_usage -> rhs_usage1 `andUDs` unf_usage
                    Nothing        -> rhs_usage1
 
     -- Rules
     -- See Note [Rules are extra RHSs] and Note [Rule dependency info]
     rules_w_uds = occAnalRules env mb_join_arity NonRecursive tagged_binder
-    rhs_usage3 = rhs_usage2 +++ combineUsageDetailsList
-                                  (map (\(_, l, r) -> l +++ r) rules_w_uds)
-    rhs_usage4 = maybe rhs_usage3 (addManyOccsSet rhs_usage3) $
-                 lookupVarEnv imp_rule_edges binder
+    rule_uds    = map (\(_, l, r) -> l `andUDs` r) rules_w_uds
+    rhs_usage3 = foldr andUDs rhs_usage2 rule_uds
+    rhs_usage4 = case lookupVarEnv imp_rule_edges binder of
+                   Nothing -> rhs_usage3
+                   Just vs -> addManyOccsSet rhs_usage3 vs
        -- See Note [Preventing loops due to imported functions rules]
 
     -- Final adjustment
@@ -846,7 +843,7 @@ occAnalRec _ lvl (AcyclicSCC (ND { nd_bndr = bndr, nd_rhs = rhs
   = (body_uds, binds)           -- See Note [Dead code]
 
   | otherwise                   -- It's mentioned in the body
-  = (body_uds' +++ rhs_uds',
+  = (body_uds' `andUDs` rhs_uds',
      NonRec tagged_bndr rhs : binds)
   where
     (body_uds', tagged_bndr) = tagNonRecBinder lvl body_uds bndr
@@ -1215,11 +1212,11 @@ makeNode env imp_rule_edges bndr_set (bndr, rhs)
     (bndrs, body) = collectBinders rhs
     (rhs_usage1, bndrs', body') = occAnalRecRhs env bndrs body
     rhs' = mkLams bndrs' body'
-    rhs_usage2 = rhs_usage1 +++ all_rule_uds
+    rhs_usage2 = foldr andUDs rhs_usage1 rule_uds
                    -- Note [Rules are extra RHSs]
                    -- Note [Rule dependency info]
     rhs_usage3 = case mb_unf_uds of
-                   Just unf_uds -> rhs_usage2 +++ unf_uds
+                   Just unf_uds -> rhs_usage2 `andUDs` unf_uds
                    Nothing      -> rhs_usage2
     node_fvs = udFreeVars bndr_set rhs_usage3
 
@@ -1235,8 +1232,7 @@ makeNode env imp_rule_edges bndr_set (bndr, rhs)
       -- See Note [Preventing loops due to imported functions rules]
                       [ (ru_act rule, udFreeVars bndr_set rhs_uds)
                       | (rule, _, rhs_uds) <- rules_w_uds ]
-    all_rule_uds = combineUsageDetailsList $
-                     concatMap (\(_, l, r) -> [l, r]) rules_w_uds
+    rule_uds = map (\(_, l, r) -> l `andUDs` r) rules_w_uds
     active_rule_fvs = unionVarSets [fvs | (a,fvs) <- rules_w_rhs_fvs
                                         , is_active a]
 
@@ -1572,7 +1568,7 @@ occAnalUnfolding env rec_flag id
       DFunUnfolding { df_bndrs = bndrs, df_args = args }
         -> Just $ zapDetails (delDetailsList usage bndrs)
         where
-          usage = foldr (+++) emptyDetails (map (fst . occAnal env) args)
+          usage = andUDsList (map (fst . occAnal env) args)
 
       _ -> Nothing
 
@@ -1708,7 +1704,7 @@ occAnal env (Tick tickish body)
   = (markAllNonTailCalled usage, Tick tickish body')
 
   | Breakpoint _ ids <- tickish
-  = (usage_lam +++ foldr addManyOccs emptyDetails ids, Tick tickish body')
+  = (usage_lam `andUDs` foldr addManyOccs emptyDetails ids, Tick tickish body')
     -- never substitute for any of the Ids in a Breakpoint
 
   | otherwise
@@ -1775,30 +1771,13 @@ occAnal env (Case scrut bndr ty alts)
   = case occ_anal_scrut scrut alts     of { (scrut_usage, scrut') ->
     case mapAndUnzip occ_anal_alt alts of { (alts_usage_s, alts')   ->
     let
-        alts_usage  = foldr combineAltsUsageDetails emptyDetails alts_usage_s
-        (alts_usage1, tagged_bndr) = tag_case_bndr alts_usage bndr
-        total_usage = markAllNonTailCalled scrut_usage +++ alts_usage1
+        alts_usage  = foldr orUDs emptyDetails alts_usage_s
+        (alts_usage1, tagged_bndr) = tagLamBinder alts_usage bndr
+        total_usage = markAllNonTailCalled scrut_usage `andUDs` alts_usage1
                         -- Alts can have tail calls, but the scrutinee can't
     in
     total_usage `seq` (total_usage, Case scrut' tagged_bndr ty alts') }}
   where
-        -- Note [Case binder usage]
-        -- ~~~~~~~~~~~~~~~~~~~~~~~~
-        -- The case binder gets a usage of either "many" or "dead", never "one".
-        -- Reason: we like to inline single occurrences, to eliminate a binding,
-        -- but inlining a case binder *doesn't* eliminate a binding.
-        -- We *don't* want to transform
-        --      case x of w { (p,q) -> f w }
-        -- into
-        --      case x of w { (p,q) -> f (p,q) }
-    tag_case_bndr usage bndr
-      = (usage', setIdOccInfo bndr final_occ_info)
-      where
-        occ_info       = lookupDetails usage bndr
-        usage'         = usage `delDetails` bndr
-        final_occ_info = case occ_info of IAmDead -> IAmDead
-                                          _       -> noOccInfo
-
     alt_env = mkAltEnv env scrut bndr
     occ_anal_alt = occAnalAlt alt_env
 
@@ -1837,7 +1816,7 @@ occAnalArgs env (arg:args) one_shots
   = case argCtxt env one_shots           of { (arg_env, one_shots') ->
     case occAnal arg_env arg             of { (uds1, arg') ->
     case occAnalArgs env args one_shots' of { (uds2, args') ->
-    (uds1 +++ uds2, arg':args') }}}
+    (uds1 `andUDs` uds2, arg':args') }}}
 
 {-
 Applications are dealt with specially because we want
@@ -1863,7 +1842,7 @@ occAnalApp env (Var fun, args, ticks)
   | null ticks = (uds, mkApps (Var fun) args')
   | otherwise  = (uds, mkTicks ticks $ mkApps (Var fun) args')
   where
-    uds = fun_uds +++ final_args_uds
+    uds = fun_uds `andUDs` final_args_uds
 
     !(args_uds, args') = occAnalArgs env args one_shots
     !final_args_uds
@@ -1893,7 +1872,7 @@ occAnalApp env (Var fun, args, ticks)
         -- See Note [Sources of one-shot information], bullet point A']
 
 occAnalApp env (fun, args, ticks)
-  = (markAllNonTailCalled (fun_uds +++ args_uds),
+  = (markAllNonTailCalled (fun_uds `andUDs` args_uds),
      mkTicks ticks $ mkApps fun' args')
   where
     !(fun_uds, fun') = occAnal (addAppCtxt env args) fun
@@ -2027,10 +2006,9 @@ occAnalAlt :: (OccEnv, Maybe (Id, CoreExpr))
 occAnalAlt (env, scrut_bind) (con, bndrs, rhs)
   = case occAnal env rhs of { (rhs_usage1, rhs1) ->
     let
-        (alt_usg, tagged_bndrs) = tagLamBinders rhs_usage1 bndrs
-                                  -- See Note [Binders in case alternatives]
-        (alt_usg', rhs2) =
-          wrapAltRHS env scrut_bind alt_usg tagged_bndrs rhs1
+      (alt_usg, tagged_bndrs) = tagLamBinders rhs_usage1 bndrs
+                                -- See Note [Binders in case alternatives]
+      (alt_usg', rhs2) = wrapAltRHS env scrut_bind alt_usg tagged_bndrs rhs1
     in
     (alt_usg', (con, tagged_bndrs, rhs2)) }
 
@@ -2045,15 +2023,19 @@ wrapAltRHS env (Just (scrut_var, let_rhs)) alt_usg bndrs alt_rhs
   , scrut_var `usedIn` alt_usg -- bndrs are not be present in alt_usg so this
                                -- handles condition (a) in Note [Binder swap]
   , not captured               -- See condition (b) in Note [Binder swap]
-  = ( alt_usg' +++ let_rhs_usg
+  = ( alt_usg' `andUDs` let_rhs_usg
     , Let (NonRec tagged_scrut_var let_rhs') alt_rhs )
   where
-    captured = any (`usedIn` let_rhs_usg) bndrs
+    captured = any (`usedIn` let_rhs_usg) bndrs  -- Check condition (b)
+
     -- The rhs of the let may include coercion variables
     -- if the scrutinee was a cast, so we must gather their
     -- usage. See Note [Gather occurrences of coercion variables]
+    -- Moreover, the rhs of the let may mention the case-binder, and
+    -- we want to gather its occ-info as well
     (let_rhs_usg, let_rhs') = occAnal env let_rhs
-    (alt_usg', [tagged_scrut_var]) = tagLamBinders alt_usg [scrut_var]
+
+    (alt_usg', tagged_scrut_var) = tagLamBinder alt_usg scrut_var
 
 wrapAltRHS _ _ alt_usg _ alt_rhs
   = (alt_usg, alt_rhs)
@@ -2313,6 +2295,9 @@ Core Lint never expects to find an *occurrence* of an Id marked
 as Dead, so we must zap the OccInfo on cb before making the
 binding x = cb.  See Trac #5028.
 
+NB: the OccInfo on /occurrences/ really doesn't matter much; the simplifier
+doesn't use it. So this is only to satisfy the perhpas-over-picky Lint.
+
 Historical note [no-case-of-case]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We *used* to suppress the binder-swap in case expressions when
@@ -2376,10 +2361,10 @@ information right.
 -}
 
 mkAltEnv :: OccEnv -> CoreExpr -> Id -> (OccEnv, Maybe (Id, CoreExpr))
--- Does two things: a) makes the occ_one_shots = OccVanilla
---                  b) extends the GlobalScruts if possible
---                  c) returns a proxy mapping, binding the scrutinee
---                     to the case binder, if possible
+-- Does three things: a) makes the occ_one_shots = OccVanilla
+--                    b) extends the GlobalScruts if possible
+--                    c) returns a proxy mapping, binding the scrutinee
+--                       to the case binder, if possible
 mkAltEnv env@(OccEnv { occ_gbl_scrut = pe }) scrut case_bndr
   = case stripTicksTopE (const True) scrut of
       Var v           -> add_scrut v case_bndr'
@@ -2388,15 +2373,19 @@ mkAltEnv env@(OccEnv { occ_gbl_scrut = pe }) scrut case_bndr
       _               -> (env { occ_encl = OccVanilla }, Nothing)
 
   where
-    add_scrut v rhs = ( env { occ_encl = OccVanilla, occ_gbl_scrut = pe `extendVarSet` v }
+    add_scrut v rhs = ( env { occ_encl = OccVanilla
+                            , occ_gbl_scrut = pe `extendVarSet` v }
                       , Just (localise v, rhs) )
 
-    case_bndr' = Var (zapIdOccInfo case_bndr) -- See Note [Zap case binders in proxy bindings]
-    localise scrut_var = mkLocalIdOrCoVar (localiseName (idName scrut_var)) (idType scrut_var)
-        -- Localise the scrut_var before shadowing it; we're making a
-        -- new binding for it, and it might have an External Name, or
-        -- even be a GlobalId; Note [Binder swap on GlobalId scrutinees]
-        -- Also we don't want any INLINE or NOINLINE pragmas!
+    case_bndr' = Var (zapIdOccInfo case_bndr)
+                   -- See Note [Zap case binders in proxy bindings]
+
+    -- Localise the scrut_var before shadowing it; we're making a
+    -- new binding for it, and it might have an External Name, or
+    -- even be a GlobalId; Note [Binder swap on GlobalId scrutinees]
+    -- Also we don't want any INLINE or NOINLINE pragmas!
+    localise scrut_var = mkLocalIdOrCoVar (localiseName (idName scrut_var))
+                                          (idType scrut_var)
 
 {-
 ************************************************************************
@@ -2441,13 +2430,13 @@ instance Outputable UsageDetails where
 -------------------
 -- UsageDetails API
 
-(+++), combineAltsUsageDetails
+andUDs, orUDs
         :: UsageDetails -> UsageDetails -> UsageDetails
-(+++) = combineUsageDetailsWith addOccInfo
-combineAltsUsageDetails = combineUsageDetailsWith orOccInfo
+andUDs = combineUsageDetailsWith addOccInfo
+orUDs  = combineUsageDetailsWith orOccInfo
 
-combineUsageDetailsList :: [UsageDetails] -> UsageDetails
-combineUsageDetailsList = foldl (+++) emptyDetails
+andUDsList :: [UsageDetails] -> UsageDetails
+andUDsList = foldl andUDs emptyDetails
 
 mkOneOcc :: OccEnv -> Id -> InterestingCxt -> JoinArity -> UsageDetails
 mkOneOcc env id int_cxt arity
@@ -2596,14 +2585,21 @@ tagLamBinders :: UsageDetails          -- Of scope
               -> [Id]                  -- Binders
               -> (UsageDetails,        -- Details with binders removed
                  [IdWithOccInfo])    -- Tagged binders
+tagLamBinders usage binders
+  = usage' `seq` (usage', bndrs')
+  where
+    (usage', bndrs') = mapAccumR tagLamBinder usage binders
+
+tagLamBinder :: UsageDetails       -- Of scope
+             -> Id                 -- Binder
+             -> (UsageDetails,     -- Details with binder removed
+                 IdWithOccInfo)    -- Tagged binders
 -- Used for lambda and case binders
 -- It copes with the fact that lambda bindings can have a
 -- stable unfolding, used for join points
-tagLamBinders usage binders = usage' `seq` (usage', bndrs')
+tagLamBinder usage bndr
+  = (usage2, bndr')
   where
-    (usage', bndrs') = mapAccumR tag_lam usage binders
-    tag_lam usage bndr = (usage2, bndr')
-      where
         occ    = lookupDetails usage bndr
         bndr'  = setBinderOcc (markNonTailCalled occ) bndr
                    -- Don't try to make an argument into a join point
@@ -2648,7 +2644,7 @@ tagRecBinders lvl body_uds triples
 
      -- 1. Determine join-point-hood of whole group, as determined by
      --    the *unadjusted* usage details
-     unadj_uds     = body_uds +++ combineUsageDetailsList rhs_udss
+     unadj_uds     = foldr andUDs body_uds rhs_udss
      will_be_joins = decideJoinPointHood lvl unadj_uds bndrs
 
      -- 2. Adjust usage details of each RHS, taking into account the
@@ -2669,7 +2665,7 @@ tagRecBinders lvl body_uds triples
              Nothing                   -- we are making join points!
 
      -- 3. Compute final usage details from adjusted RHS details
-     adj_uds   = body_uds +++ combineUsageDetailsList rhs_udss'
+     adj_uds   = foldr andUDs body_uds rhs_udss'
 
      -- 4. Tag each binder with its adjusted details
      bndrs'    = [ setBinderOcc (lookupDetails adj_uds bndr) bndr
@@ -2823,10 +2819,11 @@ orOccInfo (OneOcc { occ_in_lam = in_lam1, occ_int_cxt = int_cxt1
                   , occ_tail   = tail1 })
           (OneOcc { occ_in_lam = in_lam2, occ_int_cxt = int_cxt2
                   , occ_tail   = tail2 })
-  = OneOcc { occ_in_lam  = in_lam1 || in_lam2
-           , occ_one_br  = False -- False, because it occurs in both branches
+  = OneOcc { occ_one_br  = False -- False, because it occurs in both branches
+           , occ_in_lam  = in_lam1 || in_lam2
            , occ_int_cxt = int_cxt1 && int_cxt2
            , occ_tail    = tail1 `andTailCallInfo` tail2 }
+
 orOccInfo a1 a2 = ASSERT( not (isDeadOcc a1 || isDeadOcc a2) )
                   ManyOccs { occ_tail = tailCallInfo a1 `andTailCallInfo`
                                         tailCallInfo a2 }

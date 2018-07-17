@@ -473,7 +473,7 @@ addForeignFile = addForeignSource
 -- Note that for non-C languages (for example C++) @extern "C"@ directives
 -- must be used to get symbols that we can access from Haskell.
 --
--- To get better errors, it is reccomended to use #line pragmas when
+-- To get better errors, it is recommended to use #line pragmas when
 -- emitting C files, e.g.
 --
 -- > {-# LANGUAGE CPP #-}
@@ -494,7 +494,7 @@ addForeignSource lang src = do
   runIO $ writeFile path src
   addForeignFilePath lang path
 
--- | Same as 'addForeignSource', but expects to recieve a path pointing to the
+-- | Same as 'addForeignSource', but expects to receive a path pointing to the
 -- foreign file instead of a 'String' of its contents. Consider using this in
 -- conjunction with 'addTempFile'.
 --
@@ -731,8 +731,8 @@ trueName  = mkNameG DataName "ghc-prim" "GHC.Types" "True"
 falseName = mkNameG DataName "ghc-prim" "GHC.Types" "False"
 
 nothingName, justName :: Name
-nothingName = mkNameG DataName "base" "GHC.Base" "Nothing"
-justName    = mkNameG DataName "base" "GHC.Base" "Just"
+nothingName = mkNameG DataName "base" "GHC.Maybe" "Nothing"
+justName    = mkNameG DataName "base" "GHC.Maybe" "Just"
 
 leftName, rightName :: Name
 leftName  = mkNameG DataName "base" "Data.Either" "Left"
@@ -1620,7 +1620,12 @@ data Exp
   | RecConE Name [FieldExp]            -- ^ @{ T { x = y, z = w } }@
   | RecUpdE Exp [FieldExp]             -- ^ @{ (f x) { z = w } }@
   | StaticE Exp                        -- ^ @{ static e }@
-  | UnboundVarE Name                   -- ^ @{ _x }@ (hole)
+  | UnboundVarE Name                   -- ^ @{ _x }@
+                                       --
+                                       -- This is used for holes or unresolved
+                                       -- identifiers in AST quotes. Note that
+                                       -- it could either have a variable name
+                                       -- or constructor name.
   | LabelE String                      -- ^ @{ #x }@ ( Overloaded label )
   deriving( Show, Eq, Ord, Data, Generic )
 
@@ -1743,6 +1748,7 @@ data DerivClause = DerivClause (Maybe DerivStrategy) Cxt
 data DerivStrategy = StockStrategy    -- ^ A \"standard\" derived instance
                    | AnyclassStrategy -- ^ @-XDeriveAnyClass@
                    | NewtypeStrategy  -- ^ @-XGeneralizedNewtypeDeriving@
+                   | ViaStrategy Type -- ^ @-XDerivingVia@
   deriving( Show, Eq, Ord, Data, Generic )
 
 -- | A Pattern synonym's type. Note that a pattern synonym's *fully*

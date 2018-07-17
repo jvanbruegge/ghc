@@ -413,6 +413,12 @@ def compiler_profiled( ):
 def compiler_debugged( ):
     return config.compiler_debugged
 
+def have_gdb( ):
+    return config.have_gdb
+
+def have_readelf( ):
+    return config.have_readelf
+
 # ---
 
 def high_memory_usage(name, opts):
@@ -862,6 +868,7 @@ def do_test(name, way, func, args, files):
 
         if exit_code != 0:
             framework_fail(name, way, 'pre_cmd failed: {0}'.format(exit_code))
+            if_verbose(1, '** pre_cmd was "{0}". Running trace'.format(override_options(opts.pre_cmd)))
 
     result = func(*[name,way] + args)
 
@@ -963,8 +970,9 @@ def ghci_script( name, way, script):
 
     # We pass HC and HC_OPTS as environment variables, so that the
     # script can invoke the correct compiler by using ':! $HC $HC_OPTS'
-    cmd = ('HC={{compiler}} HC_OPTS="{flags}" {{compiler}} {flags} {way_flags}'
+    cmd = ('HC={{compiler}} HC_OPTS="{flags}" {{compiler}} {way_flags} {flags}'
           ).format(flags=flags, way_flags=way_flags)
+      # NB: put way_flags before flags so that flags in all.T can overrie others
 
     getTestOpts().stdin = script
     return simple_run( name, way, cmd, getTestOpts().extra_run_opts )
@@ -1430,7 +1438,7 @@ def stdout_ok(name, way):
                           expected_stdout_file, actual_stdout_file)
 
 def dump_stdout( name ):
-    with open(in_testdir(name, 'run.stdout')) as f:
+    with open(in_testdir(name, 'run.stdout'), encoding='utf8') as f:
         str = f.read().strip()
         if str:
             print("Stdout (", name, "):")
@@ -1446,7 +1454,7 @@ def stderr_ok(name, way):
                           whitespace_normaliser=normalise_whitespace)
 
 def dump_stderr( name ):
-    with open(in_testdir(name, 'run.stderr')) as f:
+    with open(in_testdir(name, 'run.stderr'), encoding='utf8') as f:
         str = f.read().strip()
         if str:
             print("Stderr (", name, "):")

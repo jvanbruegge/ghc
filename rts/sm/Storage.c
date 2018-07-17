@@ -220,6 +220,7 @@ initStorage (void)
 void storageAddCapabilities (uint32_t from, uint32_t to)
 {
     uint32_t n, g, i, new_n_nurseries;
+    nursery *old_nurseries;
 
     if (RtsFlags.GcFlags.nurseryChunkSize == 0) {
         new_n_nurseries = to;
@@ -229,6 +230,7 @@ void storageAddCapabilities (uint32_t from, uint32_t to)
             stg_max(to, total_alloc / RtsFlags.GcFlags.nurseryChunkSize);
     }
 
+    old_nurseries = nurseries;
     if (from > 0) {
         nurseries = stgReallocBytes(nurseries,
                                     new_n_nurseries * sizeof(struct nursery_),
@@ -240,8 +242,9 @@ void storageAddCapabilities (uint32_t from, uint32_t to)
 
     // we've moved the nurseries, so we have to update the rNursery
     // pointers from the Capabilities.
-    for (i = 0; i < to; i++) {
-        capabilities[i]->r.rNursery = &nurseries[i];
+    for (i = 0; i < from; i++) {
+        uint32_t index = capabilities[i]->r.rNursery - old_nurseries;
+        capabilities[i]->r.rNursery = &nurseries[index];
     }
 
     /* The allocation area.  Policy: keep the allocation area
@@ -1155,7 +1158,7 @@ dirty_MVAR(StgRegTable *reg, StgClosure *p)
  * -------------------------------------------------------------------------- */
 
 /* -----------------------------------------------------------------------------
- * [Note allocation accounting]
+ * Note [allocation accounting]
  *
  *   - When cap->r.rCurrentNusery moves to a new block in the nursery,
  *     we add the size of the used portion of the previous block to
@@ -1261,16 +1264,15 @@ W_ gcThreadLiveBlocks (uint32_t i, uint32_t g)
  * to store bitmaps and the mark stack.  Note: blocks_needed does not
  * include the blocks in the nursery.
  *
- * Assume: all data currently live will remain live.  Generationss
+ * Assume: all data currently live will remain live.  Generations
  * that will be collected next time will therefore need twice as many
  * blocks since all the data will be copied.
  */
 extern W_
 calcNeeded (bool force_major, memcount *blocks_needed)
 {
-    W_ needed = 0, blocks;
-    uint32_t g, N;
-    generation *gen;
+    W_ needed = 0;
+    uint32_t N;
 
     if (force_major) {
         N = RtsFlags.GcFlags.generations - 1;
@@ -1278,12 +1280,12 @@ calcNeeded (bool force_major, memcount *blocks_needed)
         N = 0;
     }
 
-    for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
-        gen = &generations[g];
+    for (uint32_t g = 0; g < RtsFlags.GcFlags.generations; g++) {
+        generation *gen = &generations[g];
 
-        blocks = gen->n_blocks // or: gen->n_words / BLOCK_SIZE_W (?)
-               + gen->n_large_blocks
-               + gen->n_compact_blocks;
+        W_ blocks = gen->n_blocks // or: gen->n_words / BLOCK_SIZE_W (?)
+                  + gen->n_large_blocks
+                  + gen->n_compact_blocks;
 
         // we need at least this much space
         needed += blocks;

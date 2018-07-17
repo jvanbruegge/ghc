@@ -3,6 +3,20 @@
 ## 4.12.0.0 *TBA*
   * Bundled with GHC *TBA*
 
+  * The STM invariant-checking mechanism (`always` and `alwaysSucceeds`), which
+    was deprecated in GHC 8.4, has been removed (as proposed in
+    <https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0011-deprecate-stm-invariants.rst>).
+    This is a bit earlier than proposed in the deprecation pragma included in
+    GHC 8.4, but due to community feedback we decided to move ahead with the
+    early removal.
+
+    Existing users are encouraged to encapsulate their STM operations in safe
+    abstractions which can perform the invariant checking without help from the
+    runtime system.
+
+  * Add a new module `GHC.ResponseFile` (previously defined in the `haddock`
+    package). (#13896)
+
   * Move the module `Data.Functor.Contravariant` from the
     `contravariant` package to `base`.
 
@@ -10,6 +24,23 @@
 
   * Add `Applicative` (for `K1`), `Semigroup` and `Monoid` instances in
     `GHC.Generics`. (#14849)
+
+  * `asinh` for `Float` and `Double` is now numerically stable in the face of
+    non-small negative arguments and enormous arguments of either sign. (#14927)
+
+  * `Numeric.showEFloat (Just 0)` now respects the user's requested precision.
+    (#15115)
+
+  * `Data.Monoid.Alt` now has `Foldable` and `Traversable` instances. (#15099)
+
+  * `Data.Monoid.Ap` has been introduced
+
+  * `Control.Exception.throw` is now levity polymorphic. (#15180)
+
+  * `Data.Ord.Down` now has a number of new instances. These include:
+    `MonadFix`, `MonadZip`, `Data`, `Foldable`, `Traversable`, `Eq1`, `Ord1`,
+    `Read1`, `Show1`, `Generic`, `Generic1`. (#15098)
+
 
 ## 4.11.1.0 *TBA*
   * Bundled with GHC 8.4.2
@@ -298,6 +329,9 @@
 
   * New `Control.Exception.TypeError` datatype, which is thrown when an
     expression fails to typecheck when run using `-fdefer-type-errors` (#10284)
+
+  * The `bitSize` method of `Data.Bits.Bits` now has a (partial!)
+    default implementation based on `bitSizeMaybe`. (#12970)
 
 ### New instances
 

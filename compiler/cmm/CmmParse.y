@@ -402,8 +402,6 @@ statics :: { [CmmParse [CmmStatic]] }
         : {- empty -}                   { [] }
         | static statics                { $1 : $2 }
     
--- Strings aren't used much in the RTS HC code, so it doesn't seem
--- worth allowing inline strings.  C-- doesn't allow them anyway.
 static  :: { CmmParse [CmmStatic] }
         : type expr ';' { do e <- $2;
                              return [CmmStaticLit (getLit e)] }
@@ -472,7 +470,7 @@ info    :: { CmmParse (CLabel, Maybe CmmInfoTable, [LocalReg]) }
                       return (mkCmmEntryLabel pkg $3,
                               Just $ CmmInfoTable { cit_lbl = mkCmmInfoLabel pkg $3
                                            , cit_rep = rep
-                                           , cit_prof = prof, cit_srt = NoC_SRT },
+                                           , cit_prof = prof, cit_srt = Nothing, cit_clo = Nothing },
                               []) }
         
         | 'INFO_TABLE_FUN' '(' NAME ',' INT ',' INT ',' INT ',' STRING ',' STRING ',' INT ')'
@@ -488,7 +486,7 @@ info    :: { CmmParse (CLabel, Maybe CmmInfoTable, [LocalReg]) }
                       return (mkCmmEntryLabel pkg $3,
                               Just $ CmmInfoTable { cit_lbl = mkCmmInfoLabel pkg $3
                                            , cit_rep = rep
-                                           , cit_prof = prof, cit_srt = NoC_SRT },
+                                           , cit_prof = prof, cit_srt = Nothing, cit_clo = Nothing },
                               []) }
                 -- we leave most of the fields zero here.  This is only used
                 -- to generate the BCO info table in the RTS at the moment.
@@ -506,7 +504,7 @@ info    :: { CmmParse (CLabel, Maybe CmmInfoTable, [LocalReg]) }
                       return (mkCmmEntryLabel pkg $3,
                               Just $ CmmInfoTable { cit_lbl = mkCmmInfoLabel pkg $3
                                            , cit_rep = rep
-                                           , cit_prof = prof, cit_srt = NoC_SRT },
+                                           , cit_prof = prof, cit_srt = Nothing,cit_clo = Nothing },
                               []) }
 
                      -- If profiling is on, this string gets duplicated,
@@ -523,7 +521,7 @@ info    :: { CmmParse (CLabel, Maybe CmmInfoTable, [LocalReg]) }
                       return (mkCmmEntryLabel pkg $3,
                               Just $ CmmInfoTable { cit_lbl = mkCmmInfoLabel pkg $3
                                            , cit_rep = rep
-                                           , cit_prof = prof, cit_srt = NoC_SRT },
+                                           , cit_prof = prof, cit_srt = Nothing, cit_clo = Nothing },
                               []) }
 
         | 'INFO_TABLE_RET' '(' NAME ',' INT ')'
@@ -534,7 +532,7 @@ info    :: { CmmParse (CLabel, Maybe CmmInfoTable, [LocalReg]) }
                       return (mkCmmRetLabel pkg $3,
                               Just $ CmmInfoTable { cit_lbl = mkCmmRetInfoLabel pkg $3
                                            , cit_rep = rep
-                                           , cit_prof = prof, cit_srt = NoC_SRT },
+                                           , cit_prof = prof, cit_srt = Nothing, cit_clo = Nothing },
                               []) }
 
         | 'INFO_TABLE_RET' '(' NAME ',' INT ',' formals0 ')'
@@ -544,12 +542,12 @@ info    :: { CmmParse (CLabel, Maybe CmmInfoTable, [LocalReg]) }
                       live <- sequence $7
                       let prof = NoProfilingInfo
                           -- drop one for the info pointer
-                          bitmap = mkLiveness dflags (map Just (drop 1 live))
+                          bitmap = mkLiveness dflags (drop 1 live)
                           rep  = mkRTSRep (fromIntegral $5) $ mkStackRep bitmap
                       return (mkCmmRetLabel pkg $3,
                               Just $ CmmInfoTable { cit_lbl = mkCmmRetInfoLabel pkg $3
                                            , cit_rep = rep
-                                           , cit_prof = prof, cit_srt = NoC_SRT },
+                                           , cit_prof = prof, cit_srt = Nothing, cit_clo = Nothing },
                               live) }
 
 body    :: { CmmParse () }

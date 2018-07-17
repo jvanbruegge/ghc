@@ -15,7 +15,7 @@ module Inst (
        instCall, instDFunType, instStupidTheta, instTyVarsWith,
        newWanted, newWanteds,
 
-       tcInstBinders, tcInstBinder,
+       tcInstTyBinders, tcInstTyBinder,
 
        newOverloadedLit, mkOverLit,
 
@@ -45,7 +45,7 @@ import TcRnMonad
 import TcEnv
 import TcEvidence
 import InstEnv
-import TysWiredIn  ( heqDataCon, coercibleDataCon )
+import TysWiredIn  ( heqDataCon )
 import CoreSyn     ( isOrphan )
 import FunDeps
 import TcMType
@@ -55,6 +55,7 @@ import TcType
 import HscTypes
 import Class( Class )
 import MkId( mkDictFunId )
+import CoreSyn( Expr(..) )  -- For the Coercion constructor
 import Id
 import Name
 import Var      ( EvVar, mkTyVar, tyVarName, TyVarBndr(..) )
@@ -352,6 +353,7 @@ instCallConstraints orig preds
        ; traceTc "instCallConstraints" (ppr evs)
        ; return (mkWpEvApps evs) }
   where
+    go :: TcPredType -> TcM EvTerm
     go pred
      | Just (Nominal, ty1, ty2) <- getEqPredTys_maybe pred -- Try short-cut #1
      = do  { co <- unifyType Nothing ty1 ty2
@@ -361,7 +363,7 @@ instCallConstraints orig preds
      | Just (tc, args@[_, _, ty1, ty2]) <- splitTyConApp_maybe pred
      , tc `hasKey` heqTyConKey
      = do { co <- unifyType Nothing ty1 ty2
-          ; return (evDFunApp (dataConWrapId heqDataCon) args [evCoercion co]) }
+          ; return (evDFunApp (dataConWrapId heqDataCon) args [Coercion co]) }
 
      | otherwise
      = emitWanted orig pred
@@ -371,10 +373,14 @@ instDFunType :: DFunId -> [DFunInstType]
                     , TcThetaType ) -- instantiated constraint
 -- See Note [DFunInstType: instantiating types] in InstEnv
 instDFunType dfun_id dfun_inst_tys
-  = do { (subst, inst_tys) <- go emptyTCvSubst dfun_tvs dfun_inst_tys
+  = do { (subst, inst_tys) <- go empty_subst dfun_tvs dfun_inst_tys
        ; return (inst_tys, substTheta subst dfun_theta) }
   where
-    (dfun_tvs, dfun_theta, _) = tcSplitSigmaTy (idType dfun_id)
+    dfun_ty = idType dfun_id
+    (dfun_tvs, dfun_theta, _) = tcSplitSigmaTy dfun_ty
+    empty_subst = mkEmptyTCvSubst (mkInScopeSet (tyCoVarsOfType dfun_ty))
+                  -- With quantified constraints, the
+                  -- type of a dfun may not be closed
 
     go :: TCvSubst -> [TyVar] -> [DFunInstType] -> TcM (TCvSubst, [TcType])
     go subst [] [] = return (subst, [])
@@ -404,25 +410,97 @@ instStupidTheta orig theta
 *                                                                      *
 ************************************************************************
 
+Note [Constraints handled in types]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Generally, we cannot handle constraints written in types. For example,
+if we declare
+
+  data C a where
+    MkC :: Show a => a -> C a
+
+we will not be able to use MkC in types, as we have no way of creating
+a type-level Show dictionary.
+
+However, we make an exception for equality types. Consider
+
+  data T1 a where
+    MkT1 :: T1 Bool
+
+  data T2 a where
+    MkT2 :: a ~ Bool => T2 a
+
+MkT1 has a constrained return type, while MkT2 uses an explicit equality
+constraint. These two types are often written interchangeably, with a
+reasonable expectation that they mean the same thing. For this to work --
+and for us to be able to promote GADTs -- we need to be able to instantiate
+equality constraints in types.
+
+One wrinkle is that the equality in MkT2 is *lifted*. But, for proper
+GADT equalities, GHC produces *unlifted* constraints. (This unlifting comes
+from DataCon.eqSpecPreds, which uses mkPrimEqPred.) And, perhaps a wily
+user will use (~~) for a heterogeneous equality. We thus must support
+all of (~), (~~), and (~#) in types. (See Note [The equality types story]
+in TysPrim for a primer on these equality types.)
+
+The get_eq_tys_maybe function recognizes these three forms of equality,
+returning a suitable type formation function and the two types related
+by the equality constraint. In the lifted case, it uses mkHEqBoxTy or
+mkEqBoxTy, which promote the datacons of the (~~) or (~) datatype,
+respectively.
+
+One might reasonably wonder who *unpacks* these boxes once they are
+made. After all, there is no type-level `case` construct. The surprising
+answer is that no one ever does. Instead, if a GADT constructor is used
+on the left-hand side of a type family equation, that occurrence forces
+GHC to unify the types in question. For example:
+
+  data G a where
+    MkG :: G Bool
+
+  type family F (x :: G a) :: a where
+    F MkG = False
+
+When checking the LHS `F MkG`, GHC sees the MkG constructor and then must
+unify F's implicit parameter `a` with Bool. This succeeds, making the equation
+
+    F Bool (MkG @Bool <Bool>) = False
+
+Note that we never need unpack the coercion. This is because type family
+equations are *not* parametric in their kind variables. That is, we could have
+just said
+
+  type family H (x :: G a) :: a where
+    H _ = False
+
+The presence of False on the RHS also forces `a` to become Bool, giving us
+
+    H Bool _ = False
+
+The fact that any of this works stems from the lack of phase separation between
+types and kinds (unlike the very present phase separation between terms and types).
+
+Once we have the ability to pattern-match on types below top-level, this will
+no longer cut it, but it seems fine for now.
+
 -}
 
 ---------------------------
 -- | This is used to instantiate binders when type-checking *types* only.
 -- The @VarEnv Kind@ gives some known instantiations.
 -- See also Note [Bidirectional type checking]
-tcInstBinders :: TCvSubst -> Maybe (VarEnv Kind)
-               -> [TyBinder] -> TcM (TCvSubst, [TcType])
-tcInstBinders subst mb_kind_info bndrs
-  = do { (subst, args) <- mapAccumLM (tcInstBinder mb_kind_info) subst bndrs
+tcInstTyBinders :: TCvSubst -> Maybe (VarEnv Kind)
+                -> [TyBinder] -> TcM (TCvSubst, [TcType])
+tcInstTyBinders subst mb_kind_info bndrs
+  = do { (subst, args) <- mapAccumLM (tcInstTyBinder mb_kind_info) subst bndrs
        ; traceTc "instantiating tybinders:"
            (vcat $ zipWith (\bndr arg -> ppr bndr <+> text ":=" <+> ppr arg)
                            bndrs args)
        ; return (subst, args) }
 
 -- | Used only in *types*
-tcInstBinder :: Maybe (VarEnv Kind)
-              -> TCvSubst -> TyBinder -> TcM (TCvSubst, TcType)
-tcInstBinder mb_kind_info subst (Named (TvBndr tv _))
+tcInstTyBinder :: Maybe (VarEnv Kind)
+               -> TCvSubst -> TyBinder -> TcM (TCvSubst, TcType)
+tcInstTyBinder mb_kind_info subst (Named (TvBndr tv _))
   = case lookup_tv tv of
       Just ki -> return (extendTvSubstAndInScope subst tv ki, ki)
       Nothing -> do { (subst', tv') <- newMetaTyVarX subst tv
@@ -432,23 +510,16 @@ tcInstBinder mb_kind_info subst (Named (TvBndr tv _))
                       ; lookupVarEnv env tv }
 
 
-tcInstBinder _ subst (Anon ty)
+tcInstTyBinder _ subst (Anon ty)
      -- This is the *only* constraint currently handled in types.
-  | Just (mk, role, k1, k2) <- get_pred_tys_maybe substed_ty
-  = do { let origin = TypeEqOrigin { uo_actual   = k1
-                                   , uo_expected = k2
-                                   , uo_thing    = Nothing
-                                   , uo_visible  = True }
-       ; co <- case role of
-                 Nominal          -> unifyKind Nothing k1 k2
-                 Representational -> emitWantedEq origin KindLevel role k1 k2
-                 Phantom          -> pprPanic "tcInstBinder Phantom" (ppr ty)
-       ; arg' <- mk co k1 k2
+  | Just (mk, k1, k2) <- get_eq_tys_maybe substed_ty
+  = do { co <- unifyKind Nothing k1 k2
+       ; arg' <- mk co
        ; return (subst, arg') }
 
   | isPredTy substed_ty
   = do { let (env, tidy_ty) = tidyOpenType emptyTidyEnv substed_ty
-       ; addErrTcM (env, text "Illegal constraint in a type:" <+> ppr tidy_ty)
+       ; addErrTcM (env, text "Illegal constraint in a kind:" <+> ppr tidy_ty)
 
          -- just invent a new variable so that we can continue
        ; u <- newUnique
@@ -463,22 +534,33 @@ tcInstBinder _ subst (Anon ty)
   where
     substed_ty = substTy subst ty
 
-      -- handle boxed equality constraints, because it's so easy
-    get_pred_tys_maybe ty
-      | Just (r, k1, k2) <- getEqPredTys_maybe ty
-      = Just (\co _ _ -> return $ mkCoercionTy co, r, k1, k2)
+      -- See Note [Constraints handled in types]
+    get_eq_tys_maybe :: Type
+                     -> Maybe ( Coercion -> TcM Type
+                                 -- given a coercion proving t1 ~# t2, produce the
+                                 -- right instantiation for the TyBinder at hand
+                              , Type  -- t1
+                              , Type  -- t2
+                              )
+    get_eq_tys_maybe ty
+        -- unlifted equality (~#)
+      | Just (Nominal, k1, k2) <- getEqPredTys_maybe ty
+      = Just (\co -> return $ mkCoercionTy co, k1, k2)
+
+        -- lifted heterogeneous equality (~~)
       | Just (tc, [_, _, k1, k2]) <- splitTyConApp_maybe ty
       = if | tc `hasKey` heqTyConKey
-             -> Just (mkHEqBoxTy, Nominal, k1, k2)
+             -> Just (\co -> mkHEqBoxTy co k1 k2, k1, k2)
            | otherwise
              -> Nothing
+
+        -- lifted homogeneous equality (~)
       | Just (tc, [_, k1, k2]) <- splitTyConApp_maybe ty
       = if | tc `hasKey` eqTyConKey
-             -> Just (mkEqBoxTy, Nominal, k1, k2)
-           | tc `hasKey` coercibleTyConKey
-             -> Just (mkCoercibleBoxTy, Representational, k1, k2)
+             -> Just (\co -> mkEqBoxTy co k1 k2, k1, k2)
            | otherwise
              -> Nothing
+
       | otherwise
       = Nothing
 
@@ -499,15 +581,6 @@ mkEqBoxTy co ty1 ty2
        ; let [datacon] = tyConDataCons eq_tc
        ; hetero <- mkHEqBoxTy co ty1 ty2
        ; return $ mkTyConApp (promoteDataCon datacon) [k, ty1, ty2, hetero] }
-  where k = typeKind ty1
-
--- | This takes @a ~R# b@ and returns @Coercible a b@.
-mkCoercibleBoxTy :: TcCoercion -> Type -> Type -> TcM Type
--- monadic just for convenience with mkEqBoxTy
-mkCoercibleBoxTy co ty1 ty2
-  = do { return $
-         mkTyConApp (promoteDataCon coercibleDataCon)
-                    [k, ty1, ty2, mkCoercionTy co] }
   where k = typeKind ty1
 
 {-

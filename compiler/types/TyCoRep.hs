@@ -34,6 +34,7 @@ module TyCoRep (
         UnivCoProvenance(..),
         CoercionHole(..), coHoleCoVar, setCoHoleCoVar,
         CoercionN, CoercionR, CoercionP, KindCoercion,
+        MCoercion(..), MCoercionR, MCoercionN,
 
         -- * Functions over types
         mkTyConTy, mkTyVarTy, mkTyVarTys,
@@ -62,7 +63,7 @@ module TyCoRep (
         pprTyVar, pprTyVars,
         pprThetaArrowTy, pprClassPred,
         pprKind, pprParendKind, pprTyLit,
-        TyPrec(..), maybeParen,
+        PprPrec(..), topPrec, sigPrec, opPrec, funPrec, appPrec, maybeParen,
         pprDataCons, ppSuggestExplicitKinds,
 
         pprCo, pprParendCo,
@@ -111,12 +112,12 @@ module TyCoRep (
         substCoUnchecked, substCoWithUnchecked,
         substTyWithInScope,
         substTys, substTheta,
-        lookupTyVar, substTyVarBndr,
+        lookupTyVar, substTyVarBndr, substTyVarBndrs,
         substCo, substCos, substCoVar, substCoVars, lookupCoVar,
         substCoVarBndr, cloneTyVarBndr, cloneTyVarBndrs,
         substTyVar, substTyVars,
         substForAllCoBndr,
-        substTyVarBndrCallback, substForAllCoBndrCallback,
+        substTyVarBndrUsing, substForAllCoBndrUsing,
         checkValidSubst, isValidTCvSubst,
 
         -- * Tidying type related things up for printing
@@ -166,7 +167,8 @@ import CoAxiom
 import FV
 
 -- others
-import BasicTypes ( LeftOrRight(..), TyPrec(..), maybeParen, pickLR )
+import BasicTypes ( LeftOrRight(..), PprPrec(..), topPrec, sigPrec, opPrec
+                  , funPrec, appPrec, maybeParen, pickLR )
 import PrelNames
 import Outputable
 import DynFlags
@@ -557,9 +559,7 @@ This table summarises the visibility rules:
     optional kind applications, thus (T @*), but we have not
     yet implemented that
 
----- Examples of where the different visibilities come from -----
-
-In term declarations:
+---- In term declarations ----
 
 * Inferred.  Function defn, with no signature:  f1 x = x
   We infer f1 :: forall {a}. a -> a, with 'a' Inferred
@@ -590,7 +590,7 @@ In term declarations:
   Inferred - from inferred types (e.g. no pattern type signature)
            - or from inferred kind polymorphism
 
-In type declarations:
+---- In type declarations ----
 
 * Inferred (k)
      data T1 a b = MkT1 (a b)
@@ -618,6 +618,19 @@ In type declarations:
   Here T's kind is  T :: forall {k1:*} (k:*). (k1->*) -> k1 -> k -> *
   So 'k' is Specified, because it appears explicitly,
   but 'k1' is Inferred, because it does not
+
+Generally, in the list of TyConBinders for a TyCon,
+
+* Inferred arguments always come first
+* Specified, Anon and Required can be mixed
+
+e.g.
+  data Foo (a :: Type) :: forall b. (a -> b -> Type) -> Type where ...
+
+Here Foo's TyConBinders are
+   [Required 'a', Specified 'b', Anon]
+and its kind prints as
+   Foo :: forall a -> forall b. (a -> b -> Type) -> Type
 
 ---- Printing -----
 
@@ -799,6 +812,7 @@ tcIsTYPE _ _ = False
 
 -- | This version considers Constraint to be the same as *. Returns True
 -- if the argument is equivalent to Type/Constraint and False otherwise.
+-- See Note [Kind Constraint and kind Type]
 isLiftedTypeKind :: Kind -> Bool
 isLiftedTypeKind = isTYPE is_lifted
   where
@@ -847,8 +861,8 @@ data Coercion
   --    -   _ stands for a parameter that is not a Role or Coercion.
 
   -- These ones mirror the shape of types
-  = -- Refl :: "e" -> _ -> e
-    Refl Role Type  -- See Note [Refl invariant]
+  = -- Refl :: _ -> N
+    Refl Type  -- See Note [Refl invariant]
           -- Invariant: applications of (Refl T) to a bunch of identity coercions
           --            always show up as Refl.
           -- For example  (Refl T) (Refl a) (Refl b) shows up as (Refl (T a b)).
@@ -859,7 +873,13 @@ data Coercion
           -- ConAppCo coercions (like all coercions other than Refl)
           -- are NEVER the identity.
 
-          -- Use (Refl Representational _), not (SubCo (Refl Nominal _))
+          -- Use (GRefl Representational ty MRefl), not (SubCo (Refl ty))
+
+  -- GRefl :: "e" -> _ -> Maybe N -> e
+  -- See Note [Generalized reflexive coercion]
+  | GRefl Role Type MCoercionN  -- See Note [Refl invariant]
+          -- Use (Refl ty), not (GRefl Nominal ty MRefl)
+          -- Use (GRefl Representational _ _), not (SubCo (GRefl Nominal _ _))
 
   -- These ones simply lift the correspondingly-named
   -- Type constructors into Coercions
@@ -919,11 +939,6 @@ data Coercion
     -- :: e -> N -> e
     -- See Note [InstCo roles]
 
-  -- Coherence applies a coercion to the left-hand type of another coercion
-  -- See Note [Coherence]
-  | CoherenceCo Coercion KindCoercion
-     -- :: e -> N -> e
-
   -- Extract a kind coercion from a (heterogeneous) type coercion
   -- NB: all kind coercions are Nominal
   | KindCo Coercion
@@ -941,13 +956,28 @@ type CoercionR = Coercion       -- always representational
 type CoercionP = Coercion       -- always phantom
 type KindCoercion = CoercionN   -- always nominal
 
+-- | A semantically more meaningful type to represent what may or may not be a
+-- useful 'Coercion'.
+data MCoercion
+  = MRefl
+    -- A trivial Reflexivity coercion
+  | MCo Coercion
+    -- Other coercions
+  deriving Data.Data
+type MCoercionR = MCoercion
+type MCoercionN = MCoercion
+
+instance Outputable MCoercion where
+  ppr MRefl    = text "MRefl"
+  ppr (MCo co) = text "MCo" <+> ppr co
+
 {-
 Note [Refl invariant]
 ~~~~~~~~~~~~~~~~~~~~~
 Invariant 1:
 
 Coercions have the following invariant
-     Refl is always lifted as far as possible.
+     Refl (similar for GRefl r ty MRefl) is always lifted as far as possible.
 
 You might think that a consequencs is:
      Every identity coercions has Refl at the root
@@ -957,6 +987,42 @@ But that's not quite true because of coercion variables.  Consider
      Left h    where h :: Maybe Int ~ Maybe Int
 etc.  So the consequence is only true of coercions that
 have no coercion variables.
+
+Note [Generalized reflexive coercion]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+GRefl is a generalized reflexive coercion (see Trac #15192). It wraps a kind
+coercion, which might be reflexive (MRefl) or any coercion (MCo co). The typing
+rules for GRefl:
+
+  ty : k1
+  ------------------------------------
+  GRefl r ty MRefl: ty ~r ty
+
+  ty : k1       co :: k1 ~ k2
+  ------------------------------------
+  GRefl r ty (MCo co) : ty ~r ty |> co
+
+Consider we have
+
+   g1 :: s ~r t
+   s  :: k1
+   g2 :: k1 ~ k2
+
+and we want to construct a coercions co which has type
+
+   (s |> g2) ~r t
+
+We can define
+
+   co = Sym (GRefl r s g2) ; g1
+
+It is easy to see that
+
+   Refl == GRefl Nominal ty MRefl :: ty ~n ty
+
+A nominal reflexive coercion is quite common, so we keep the special form Refl to
+save allocation.
 
 Note [Coercion axioms applied to coercions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1048,19 +1114,6 @@ This all really would work storing just a Name in the ForAllCo. But we can't
 add Names to, e.g., VarSets, and there generally is just an impedance mismatch
 in a bunch of places. So we use tv1. When we need tv2, we can use
 setTyVarKind.
-
-Note [Coherence]
-~~~~~~~~~~~~~~~~
-The Coherence typing rule is thus:
-
-  g1 : s ~ t    s : k1    g2 : k1 ~ k2
-  ------------------------------------
-  CoherenceCo g1 g2 : (s |> g2) ~ t
-
-While this looks (and is) unsymmetric, a combination of other coercion
-combinators can make the symmetric version.
-
-For role information, see Note [Roles and kind coercions].
 
 Note [Predicate coercions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1573,10 +1626,17 @@ tyCoVarsOfCoList :: Coercion -> [TyCoVar]
 -- See Note [Free variables of types]
 tyCoVarsOfCoList co = fvVarList $ tyCoFVsOfCo co
 
+tyCoFVsOfMCo :: MCoercion -> FV
+tyCoFVsOfMCo MRefl    = emptyFV
+tyCoFVsOfMCo (MCo co) = tyCoFVsOfCo co
+
 tyCoFVsOfCo :: Coercion -> FV
 -- Extracts type and coercion variables from a coercion
 -- See Note [Free variables of types]
-tyCoFVsOfCo (Refl _ ty)         fv_cand in_scope acc = tyCoFVsOfType ty fv_cand in_scope acc
+tyCoFVsOfCo (Refl ty) fv_cand in_scope acc
+  = tyCoFVsOfType ty fv_cand in_scope acc
+tyCoFVsOfCo (GRefl _ ty mco) fv_cand in_scope acc
+  = (tyCoFVsOfType ty `unionFV` tyCoFVsOfMCo mco) fv_cand in_scope acc
 tyCoFVsOfCo (TyConAppCo _ _ cos) fv_cand in_scope acc = tyCoFVsOfCos cos fv_cand in_scope acc
 tyCoFVsOfCo (AppCo co arg) fv_cand in_scope acc
   = (tyCoFVsOfCo co `unionFV` tyCoFVsOfCo arg) fv_cand in_scope acc
@@ -1598,7 +1658,6 @@ tyCoFVsOfCo (TransCo co1 co2)   fv_cand in_scope acc = (tyCoFVsOfCo co1 `unionFV
 tyCoFVsOfCo (NthCo _ _ co)      fv_cand in_scope acc = tyCoFVsOfCo co fv_cand in_scope acc
 tyCoFVsOfCo (LRCo _ co)         fv_cand in_scope acc = tyCoFVsOfCo co fv_cand in_scope acc
 tyCoFVsOfCo (InstCo co arg)     fv_cand in_scope acc = (tyCoFVsOfCo co `unionFV` tyCoFVsOfCo arg) fv_cand in_scope acc
-tyCoFVsOfCo (CoherenceCo c1 c2) fv_cand in_scope acc = (tyCoFVsOfCo c1 `unionFV` tyCoFVsOfCo c2) fv_cand in_scope acc
 tyCoFVsOfCo (KindCo co)         fv_cand in_scope acc = tyCoFVsOfCo co fv_cand in_scope acc
 tyCoFVsOfCo (SubCo co)          fv_cand in_scope acc = tyCoFVsOfCo co fv_cand in_scope acc
 tyCoFVsOfCo (AxiomRuleCo _ cs)  fv_cand in_scope acc = tyCoFVsOfCos cs fv_cand in_scope acc
@@ -1643,9 +1702,14 @@ coVarsOfType (CoercionTy co)     = coVarsOfCo co
 coVarsOfTypes :: [Type] -> TyCoVarSet
 coVarsOfTypes tys = mapUnionVarSet coVarsOfType tys
 
+coVarsOfMCo :: MCoercion -> CoVarSet
+coVarsOfMCo MRefl    = emptyVarSet
+coVarsOfMCo (MCo co) = coVarsOfCo co
+
 coVarsOfCo :: Coercion -> CoVarSet
 -- Extract *coercion* variables only.  Tiresome to repeat the code, but easy.
-coVarsOfCo (Refl _ ty)         = coVarsOfType ty
+coVarsOfCo (Refl ty)             = coVarsOfType ty
+coVarsOfCo (GRefl _ ty co)       = coVarsOfType ty `unionVarSet` coVarsOfMCo co
 coVarsOfCo (TyConAppCo _ _ args) = coVarsOfCos args
 coVarsOfCo (AppCo co arg)      = coVarsOfCo co `unionVarSet` coVarsOfCo arg
 coVarsOfCo (ForAllCo tv kind_co co)
@@ -1661,7 +1725,6 @@ coVarsOfCo (TransCo co1 co2)    = coVarsOfCo co1 `unionVarSet` coVarsOfCo co2
 coVarsOfCo (NthCo _ _ co)       = coVarsOfCo co
 coVarsOfCo (LRCo _ co)          = coVarsOfCo co
 coVarsOfCo (InstCo co arg)      = coVarsOfCo co `unionVarSet` coVarsOfCo arg
-coVarsOfCo (CoherenceCo c1 c2)  = coVarsOfCos [c1, c2]
 coVarsOfCo (KindCo co)          = coVarsOfCo co
 coVarsOfCo (SubCo co)           = coVarsOfCo co
 coVarsOfCo (AxiomRuleCo _ cs)   = coVarsOfCos cs
@@ -1749,10 +1812,15 @@ noFreeVarsOfType (LitTy _)        = True
 noFreeVarsOfType (CastTy ty co)   = noFreeVarsOfType ty && noFreeVarsOfCo co
 noFreeVarsOfType (CoercionTy co)  = noFreeVarsOfCo co
 
+noFreeVarsOfMCo :: MCoercion -> Bool
+noFreeVarsOfMCo MRefl    = True
+noFreeVarsOfMCo (MCo co) = noFreeVarsOfCo co
+
 -- | Returns True if this coercion has no free variables. Should be the same as
 -- isEmptyVarSet . tyCoVarsOfCo, but faster in the non-forall case.
 noFreeVarsOfCo :: Coercion -> Bool
-noFreeVarsOfCo (Refl _ ty)            = noFreeVarsOfType ty
+noFreeVarsOfCo (Refl ty)              = noFreeVarsOfType ty
+noFreeVarsOfCo (GRefl _ ty co)        = noFreeVarsOfType ty && noFreeVarsOfMCo co
 noFreeVarsOfCo (TyConAppCo _ _ args)  = all noFreeVarsOfCo args
 noFreeVarsOfCo (AppCo c1 c2)          = noFreeVarsOfCo c1 && noFreeVarsOfCo c2
 noFreeVarsOfCo co@(ForAllCo {})       = isEmptyVarSet (tyCoVarsOfCo co)
@@ -1768,7 +1836,6 @@ noFreeVarsOfCo (TransCo co1 co2)      = noFreeVarsOfCo co1 && noFreeVarsOfCo co2
 noFreeVarsOfCo (NthCo _ _ co)         = noFreeVarsOfCo co
 noFreeVarsOfCo (LRCo _ co)            = noFreeVarsOfCo co
 noFreeVarsOfCo (InstCo co1 co2)       = noFreeVarsOfCo co1 && noFreeVarsOfCo co2
-noFreeVarsOfCo (CoherenceCo co1 co2)  = noFreeVarsOfCo co1 && noFreeVarsOfCo co2
 noFreeVarsOfCo (KindCo co)            = noFreeVarsOfCo co
 noFreeVarsOfCo (SubCo co)             = noFreeVarsOfCo co
 noFreeVarsOfCo (AxiomRuleCo _ cs)     = all noFreeVarsOfCo cs
@@ -1807,7 +1874,7 @@ data TCvSubst
   = TCvSubst InScopeSet -- The in-scope type and kind variables
              TvSubstEnv -- Substitutes both type and kind variables
              CvSubstEnv -- Substitutes coercion variables
-        -- See Note [Apply Once]
+        -- See Note [Substitutions apply only once]
         -- and Note [Extending the TvSubstEnv]
         -- and Note [Substituting types and coercions]
         -- and Note [The substitution invariant]
@@ -1815,21 +1882,51 @@ data TCvSubst
 -- | A substitution of 'Type's for 'TyVar's
 --                 and 'Kind's for 'KindVar's
 type TvSubstEnv = TyVarEnv Type
-        -- A TvSubstEnv is used both inside a TCvSubst (with the apply-once
-        -- invariant discussed in Note [Apply Once]), and also independently
-        -- in the middle of matching, and unification (see Types.Unify)
-        -- So you have to look at the context to know if it's idempotent or
-        -- apply-once or whatever
+  -- NB: A TvSubstEnv is used
+  --   both inside a TCvSubst (with the apply-once invariant
+  --        discussed in Note [Substitutions apply only once],
+  --   and  also independently in the middle of matching,
+  --        and unification (see Types.Unify).
+  -- So you have to look at the context to know if it's idempotent or
+  -- apply-once or whatever
 
 -- | A substitution of 'Coercion's for 'CoVar's
 type CvSubstEnv = CoVarEnv Coercion
 
-{-
-Note [Apply Once]
-~~~~~~~~~~~~~~~~~
+{- Note [The substitution invariant]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When calling (substTy subst ty) it should be the case that
+the in-scope set in the substitution is a superset of both:
+
+  (SIa) The free vars of the range of the substitution
+  (SIb) The free vars of ty minus the domain of the substitution
+
+The same rules apply to other substitutions (notably CoreSubst.Subst)
+
+* Reason for (SIa). Consider
+      substTy [a :-> Maybe b] (forall b. b->a)
+  we must rename the forall b, to get
+      forall b2. b2 -> Maybe b
+  Making 'b' part of the in-scope set forces this renaming to
+  take place.
+
+* Reason for (SIb). Consider
+     substTy [a :-> Maybe b] (forall b. (a,b,x))
+  Then if we use the in-scope set {b}, satisfying (SIa), there is
+  a danger we will rename the forall'd variable to 'x' by mistake,
+  getting this:
+      forall x. (List b, x, x)
+  Breaking (SIb) caused the bug from #11371.
+
+Note: if the free vars of the range of the substitution are freshly created,
+then the problems of (SIa) can't happen, and so it would be sound to
+ignore (SIa).
+
+Note [Substitutions apply only once]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We use TCvSubsts to instantiate things, and we might instantiate
         forall a b. ty
-\with the types
+with the types
         [a, b], or [b, a].
 So the substitution might go [a->b, b->a].  A similar situation arises in Core
 when we find a beta redex like
@@ -1837,9 +1934,9 @@ when we find a beta redex like
 Then we also end up with a substitution that permutes type variables. Other
 variations happen to; for example [a -> (a, b)].
 
-        ****************************************************
-        *** So a TCvSubst must be applied precisely once ***
-        ****************************************************
+        ********************************************************
+        *** So a substitution must be applied precisely once ***
+        ********************************************************
 
 A TCvSubst is not idempotent, but, unlike the non-idempotent substitution
 we use during unifications, it must not be repeatedly applied.
@@ -1882,25 +1979,6 @@ Note that the TvSubstEnv should *never* map a CoVar (built with the Id
 constructor) and the CvSubstEnv should *never* map a TyVar. Furthermore,
 the range of the TvSubstEnv should *never* include a type headed with
 CoercionTy.
-
-Note [The substitution invariant]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-When calling (substTy subst ty) it should be the case that
-the in-scope set in the substitution is a superset of both:
-
-  * The free vars of the range of the substitution
-  * The free vars of ty minus the domain of the substitution
-
-If we want to substitute [a -> ty1, b -> ty2] I used to
-think it was enough to generate an in-scope set that includes
-fv(ty1,ty2).  But that's not enough; we really should also take the
-free vars of the type we are substituting into!  Example:
-     (forall b. (a,b,x)) [a -> List b]
-Then if we use the in-scope set {b}, there is a danger we will rename
-the forall'd variable to 'x' by mistake, getting this:
-     (forall x. (List b, x, x))
-
-Breaking this invariant caused the bug from #11371.
 -}
 
 emptyTvSubstEnv :: TvSubstEnv
@@ -2267,17 +2345,15 @@ isValidTCvSubst (TCvSubst in_scope tenv cenv) =
 checkValidSubst :: HasCallStack => TCvSubst -> [Type] -> [Coercion] -> a -> a
 checkValidSubst subst@(TCvSubst in_scope tenv cenv) tys cos a
 -- TODO (RAE): Change back to ASSERT
-  = WARN( not ({-#SCC "isValidTCvSubst" #-} isValidTCvSubst subst),
+  = WARN( not (isValidTCvSubst subst),
              text "in_scope" <+> ppr in_scope $$
              text "tenv" <+> ppr tenv $$
-             text "tenvFVs"
-               <+> ppr (tyCoVarsOfTypesSet tenv) $$
+             text "tenvFVs" <+> ppr (tyCoVarsOfTypesSet tenv) $$
              text "cenv" <+> ppr cenv $$
-             text "cenvFVs"
-               <+> ppr (tyCoVarsOfCosSet cenv) $$
+             text "cenvFVs" <+> ppr (tyCoVarsOfCosSet cenv) $$
              text "tys" <+> ppr tys $$
              text "cos" <+> ppr cos )
-    WARN( not ({-#SCC "tysCosFVsInScope" #-} tysCosFVsInScope),
+    WARN( not tysCosFVsInScope,
              text "in_scope" <+> ppr in_scope $$
              text "tenv" <+> ppr tenv $$
              text "cenv" <+> ppr cenv $$
@@ -2420,8 +2496,13 @@ subst_co subst co
     go_ty :: Type -> Type
     go_ty = subst_ty subst
 
+    go_mco :: MCoercion -> MCoercion
+    go_mco MRefl    = MRefl
+    go_mco (MCo co) = MCo (go co)
+
     go :: Coercion -> Coercion
-    go (Refl r ty)           = mkReflCo r $! go_ty ty
+    go (Refl ty)             = mkNomReflCo $! (go_ty ty)
+    go (GRefl r ty mco)      = (mkGReflCo r $! (go_ty ty)) $! (go_mco mco)
     go (TyConAppCo r tc args)= let args' = map go args
                                in  args' `seqList` mkTyConAppCo r tc args'
     go (AppCo co arg)        = (mkAppCo $! go co) $! go arg
@@ -2438,7 +2519,6 @@ subst_co subst co
     go (NthCo r d co)        = mkNthCo r d $! (go co)
     go (LRCo lr co)          = mkLRCo lr $! (go co)
     go (InstCo co arg)       = (mkInstCo $! (go co)) $! go arg
-    go (CoherenceCo co1 co2) = (mkCoherenceCo $! (go co1)) $! (go co2)
     go (KindCo co)           = mkKindCo $! (go co)
     go (SubCo co)            = mkSubCo $! (go co)
     go (AxiomRuleCo c cs)    = let cs1 = map go cs
@@ -2458,7 +2538,7 @@ subst_co subst co
 
 substForAllCoBndr :: TCvSubst -> TyVar -> Coercion -> (TCvSubst, TyVar, Coercion)
 substForAllCoBndr subst
-  = substForAllCoBndrCallback False (substCo subst) subst
+  = substForAllCoBndrUsing False (substCo subst) subst
 
 -- | Like 'substForAllCoBndr', but disables sanity checks.
 -- The problems that the sanity checks in substCo catch are described in
@@ -2467,14 +2547,14 @@ substForAllCoBndr subst
 -- substCo and remove this function. Please don't use in new code.
 substForAllCoBndrUnchecked :: TCvSubst -> TyVar -> Coercion -> (TCvSubst, TyVar, Coercion)
 substForAllCoBndrUnchecked subst
-  = substForAllCoBndrCallback False (substCoUnchecked subst) subst
+  = substForAllCoBndrUsing False (substCoUnchecked subst) subst
 
 -- See Note [Sym and ForAllCo]
-substForAllCoBndrCallback :: Bool  -- apply sym to binder?
+substForAllCoBndrUsing :: Bool  -- apply sym to binder?
                           -> (Coercion -> Coercion)  -- transformation to kind co
                           -> TCvSubst -> TyVar -> Coercion
                           -> (TCvSubst, TyVar, Coercion)
-substForAllCoBndrCallback sym sco (TCvSubst in_scope tenv cenv)
+substForAllCoBndrUsing sym sco (TCvSubst in_scope tenv cenv)
                           old_var old_kind_co
   = ( TCvSubst (in_scope `extendInScopeSet` new_var) new_env cenv
     , new_var, new_kind_co )
@@ -2507,7 +2587,10 @@ lookupCoVar :: TCvSubst -> Var  -> Maybe Coercion
 lookupCoVar (TCvSubst _ _ cenv) v = lookupVarEnv cenv v
 
 substTyVarBndr :: HasCallStack => TCvSubst -> TyVar -> (TCvSubst, TyVar)
-substTyVarBndr = substTyVarBndrCallback substTy
+substTyVarBndr = substTyVarBndrUsing substTy
+
+substTyVarBndrs :: HasCallStack => TCvSubst -> [TyVar] -> (TCvSubst, [TyVar])
+substTyVarBndrs = mapAccumL substTyVarBndr
 
 -- | Like 'substTyVarBndr' but disables sanity checks.
 -- The problems that the sanity checks in substTy catch are described in
@@ -2515,13 +2598,15 @@ substTyVarBndr = substTyVarBndrCallback substTy
 -- The goal of #11371 is to migrate all the calls of substTyUnchecked to
 -- substTy and remove this function. Please don't use in new code.
 substTyVarBndrUnchecked :: TCvSubst -> TyVar -> (TCvSubst, TyVar)
-substTyVarBndrUnchecked = substTyVarBndrCallback substTyUnchecked
+substTyVarBndrUnchecked = substTyVarBndrUsing substTyUnchecked
 
 -- | Substitute a tyvar in a binding position, returning an
 -- extended subst and a new tyvar.
-substTyVarBndrCallback :: (TCvSubst -> Type -> Type)  -- ^ the subst function
-                       -> TCvSubst -> TyVar -> (TCvSubst, TyVar)
-substTyVarBndrCallback subst_fn subst@(TCvSubst in_scope tenv cenv) old_var
+-- Use the supplied function to substitute in the kind
+substTyVarBndrUsing
+  :: (TCvSubst -> Type -> Type)  -- ^ Use this to substitute in the kind
+  -> TCvSubst -> TyVar -> (TCvSubst, TyVar)
+substTyVarBndrUsing subst_fn subst@(TCvSubst in_scope tenv cenv) old_var
   = ASSERT2( _no_capture, pprTyVar old_var $$ pprTyVar new_var $$ ppr subst )
     ASSERT( isTyVar old_var )
     (TCvSubst (in_scope `extendInScopeSet` new_var) new_env cenv, new_var)
@@ -2608,16 +2693,19 @@ defined to use this.  @pprParendType@ is the same, except it puts
 parens around the type, except for the atomic cases.  @pprParendType@
 works just by setting the initial context precedence very high.
 
+Note that any function which pretty-prints a @Type@ first converts the @Type@
+to an @IfaceType@. See Note [IfaceType and pretty-printing] in IfaceType.
+
 See Note [Precedence in types] in BasicTypes.
 -}
 
 ------------------
 
 pprType, pprParendType :: Type -> SDoc
-pprType       = pprPrecType TopPrec
-pprParendType = pprPrecType TyConPrec
+pprType       = pprPrecType topPrec
+pprParendType = pprPrecType appPrec
 
-pprPrecType :: TyPrec -> Type -> SDoc
+pprPrecType :: PprPrec -> Type -> SDoc
 pprPrecType prec ty
   = getPprStyle $ \sty ->
     if debugStyle sty           -- Use pprDebugType when in
@@ -2678,10 +2766,10 @@ pprClassPred clas tys = pprTypeApp (classTyCon clas) tys
 
 ------------
 pprTheta :: ThetaType -> SDoc
-pprTheta = pprIfaceContext TopPrec . map tidyToIfaceType
+pprTheta = pprIfaceContext topPrec . map tidyToIfaceType
 
 pprParendTheta :: ThetaType -> SDoc
-pprParendTheta = pprIfaceContext TyConPrec . map tidyToIfaceType
+pprParendTheta = pprIfaceContext appPrec . map tidyToIfaceType
 
 pprThetaArrowTy :: ThetaType -> SDoc
 pprThetaArrowTy = pprIfaceContextArr . map tidyToIfaceType
@@ -2741,9 +2829,9 @@ debugPprType :: Type -> SDoc
 -- be useful for debugging.  E.g. with -dppr-debug it prints the
 -- kind on type-variable /occurrences/ which the normal route
 -- fundamentally cannot do.
-debugPprType ty = debug_ppr_ty TopPrec ty
+debugPprType ty = debug_ppr_ty topPrec ty
 
-debug_ppr_ty :: TyPrec -> Type -> SDoc
+debug_ppr_ty :: PprPrec -> Type -> SDoc
 debug_ppr_ty _ (LitTy l)
   = ppr l
 
@@ -2751,21 +2839,21 @@ debug_ppr_ty _ (TyVarTy tv)
   = ppr tv  -- With -dppr-debug we get (tv :: kind)
 
 debug_ppr_ty prec (FunTy arg res)
-  = maybeParen prec FunPrec $
-    sep [debug_ppr_ty FunPrec arg, arrow <+> debug_ppr_ty prec res]
+  = maybeParen prec funPrec $
+    sep [debug_ppr_ty funPrec arg, arrow <+> debug_ppr_ty prec res]
 
 debug_ppr_ty prec (TyConApp tc tys)
   | null tys  = ppr tc
-  | otherwise = maybeParen prec TyConPrec $
-                hang (ppr tc) 2 (sep (map (debug_ppr_ty TyConPrec) tys))
+  | otherwise = maybeParen prec appPrec $
+                hang (ppr tc) 2 (sep (map (debug_ppr_ty appPrec) tys))
 
 debug_ppr_ty prec (AppTy t1 t2)
   = hang (debug_ppr_ty prec t1)
-       2 (debug_ppr_ty TyConPrec t2)
+       2 (debug_ppr_ty appPrec t2)
 
 debug_ppr_ty prec (CastTy ty co)
-  = maybeParen prec TopPrec $
-    hang (debug_ppr_ty TopPrec ty)
+  = maybeParen prec topPrec $
+    hang (debug_ppr_ty topPrec ty)
        2 (text "|>" <+> ppr co)
 
 debug_ppr_ty _ (CoercionTy co)
@@ -2773,7 +2861,7 @@ debug_ppr_ty _ (CoercionTy co)
 
 debug_ppr_ty prec ty@(ForAllTy {})
   | (tvs, body) <- split ty
-  = maybeParen prec FunPrec $
+  = maybeParen prec funPrec $
     hang (text "forall" <+> fsep (map ppr tvs) <> dot)
          -- The (map ppr tvs) will print kind-annotated
          -- tvs, because we are (usually) in debug-style
@@ -2841,7 +2929,7 @@ pprDataConWithArgs dc = sep [forAllDoc, thetaDoc, ppr dc <+> argsDoc]
 
 pprTypeApp :: TyCon -> [Type] -> SDoc
 pprTypeApp tc tys
-  = pprIfaceTypeApp TopPrec (toIfaceTyCon tc)
+  = pprIfaceTypeApp topPrec (toIfaceTyCon tc)
                             (toIfaceTcArgs tc tys)
     -- TODO: toIfaceTcArgs seems rather wasteful here
 
@@ -3016,7 +3104,11 @@ tidyCo :: TidyEnv -> Coercion -> Coercion
 tidyCo env@(_, subst) co
   = go co
   where
-    go (Refl r ty)           = Refl r (tidyType env ty)
+    go_mco MRefl    = MRefl
+    go_mco (MCo co) = MCo (go co)
+
+    go (Refl ty)             = Refl (tidyType env ty)
+    go (GRefl r ty mco)      = GRefl r (tidyType env ty) $! go_mco mco
     go (TyConAppCo r tc cos) = let args = map go cos
                                in args `seqList` TyConAppCo r tc args
     go (AppCo co1 co2)       = (AppCo $! go co1) $! go co2
@@ -3038,7 +3130,6 @@ tidyCo env@(_, subst) co
     go (NthCo r d co)        = NthCo r d $! go co
     go (LRCo lr co)          = LRCo lr $! go co
     go (InstCo co ty)        = (InstCo $! go co) $! go ty
-    go (CoherenceCo co1 co2) = (CoherenceCo $! go co1) $! go co2
     go (KindCo co)           = KindCo $! go co
     go (SubCo co)            = SubCo $! go co
     go (AxiomRuleCo ax cos)  = let cos1 = tidyCos env cos
@@ -3083,7 +3174,9 @@ typeSize (CastTy ty co)             = typeSize ty + coercionSize co
 typeSize (CoercionTy co)            = coercionSize co
 
 coercionSize :: Coercion -> Int
-coercionSize (Refl _ ty)         = typeSize ty
+coercionSize (Refl ty)             = typeSize ty
+coercionSize (GRefl _ ty MRefl)    = typeSize ty
+coercionSize (GRefl _ ty (MCo co)) = 1 + typeSize ty + coercionSize co
 coercionSize (TyConAppCo _ _ args) = 1 + sum (map coercionSize args)
 coercionSize (AppCo co arg)      = coercionSize co + coercionSize arg
 coercionSize (ForAllCo _ h co)   = 1 + coercionSize co + coercionSize h
@@ -3097,7 +3190,6 @@ coercionSize (TransCo co1 co2)   = 1 + coercionSize co1 + coercionSize co2
 coercionSize (NthCo _ _ co)      = 1 + coercionSize co
 coercionSize (LRCo  _ co)        = 1 + coercionSize co
 coercionSize (InstCo co arg)     = 1 + coercionSize co + coercionSize arg
-coercionSize (CoherenceCo c1 c2) = 1 + coercionSize c1 + coercionSize c2
 coercionSize (KindCo co)         = 1 + coercionSize co
 coercionSize (SubCo co)          = 1 + coercionSize co
 coercionSize (AxiomRuleCo _ cs)  = 1 + sum (map coercionSize cs)

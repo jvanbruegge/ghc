@@ -16,6 +16,7 @@ module HsInstances where
 
 import Data.Data hiding ( Fixity )
 
+import GhcPrelude
 import HsExtension
 import HsBinds
 import HsDecls
@@ -23,6 +24,7 @@ import HsExpr
 import HsLit
 import HsTypes
 import HsPat
+import HsImpExp
 
 -- ---------------------------------------------------------------------
 -- Data derivations from HsSyn -----------------------------------------
@@ -182,6 +184,11 @@ deriving instance Data (DerivDecl GhcPs)
 deriving instance Data (DerivDecl GhcRn)
 deriving instance Data (DerivDecl GhcTc)
 
+-- deriving instance (DataIdLR p p) => Data (DerivStrategy p)
+deriving instance Data (DerivStrategy GhcPs)
+deriving instance Data (DerivStrategy GhcRn)
+deriving instance Data (DerivStrategy GhcTc)
+
 -- deriving instance (DataIdLR p p) => Data (DefaultDecl p)
 deriving instance Data (DefaultDecl GhcPs)
 deriving instance Data (DefaultDecl GhcRn)
@@ -206,11 +213,6 @@ deriving instance Data (RuleDecl GhcTc)
 deriving instance Data (RuleBndr GhcPs)
 deriving instance Data (RuleBndr GhcRn)
 deriving instance Data (RuleBndr GhcTc)
-
--- deriving instance (DataIdLR p p) => Data (VectDecl p)
-deriving instance Data (VectDecl GhcPs)
-deriving instance Data (VectDecl GhcRn)
-deriving instance Data (VectDecl GhcTc)
 
 -- deriving instance (DataId p)     => Data (WarnDecls p)
 deriving instance Data (WarnDecls GhcPs)
@@ -286,6 +288,8 @@ deriving instance (Data body) => Data (StmtLR   GhcPs GhcRn body)
 deriving instance (Data body) => Data (StmtLR   GhcRn GhcRn body)
 deriving instance (Data body) => Data (StmtLR   GhcTc GhcTc body)
 
+deriving instance Data RecStmtTc
+
 -- deriving instance (DataIdLR p p) => Data (ParStmtBlock p p)
 deriving instance Data (ParStmtBlock GhcPs GhcPs)
 deriving instance Data (ParStmtBlock GhcPs GhcRn)
@@ -343,6 +347,8 @@ deriving instance Data (Pat GhcPs)
 deriving instance Data (Pat GhcRn)
 deriving instance Data (Pat GhcTc)
 
+deriving instance Data ListPatTc
+
 -- deriving instance (DataIdLR p p, Data body) => Data (HsRecFields p body)
 deriving instance (Data body) => Data (HsRecFields GhcPs body)
 deriving instance (Data body) => Data (HsRecFields GhcRn body)
@@ -376,16 +382,6 @@ deriving instance Data (HsType GhcPs)
 deriving instance Data (HsType GhcRn)
 deriving instance Data (HsType GhcTc)
 
--- deriving instance (DataId p)     => Data (HsWildCardInfo p)
-deriving instance Data (HsWildCardInfo GhcPs)
-deriving instance Data (HsWildCardInfo GhcRn)
-deriving instance Data (HsWildCardInfo GhcTc)
-
--- deriving instance (DataIdLR p p) => Data (HsAppType p)
-deriving instance Data (HsAppType GhcPs)
-deriving instance Data (HsAppType GhcRn)
-deriving instance Data (HsAppType GhcTc)
-
 -- deriving instance (DataIdLR p p) => Data (ConDeclField p)
 deriving instance Data (ConDeclField GhcPs)
 deriving instance Data (ConDeclField GhcRn)
@@ -401,5 +397,20 @@ deriving instance Data (AmbiguousFieldOcc GhcPs)
 deriving instance Data (AmbiguousFieldOcc GhcRn)
 deriving instance Data (AmbiguousFieldOcc GhcTc)
 
+
+-- deriving instance (DataId name) => Data (ImportDecl name)
+deriving instance Data (ImportDecl GhcPs)
+deriving instance Data (ImportDecl GhcRn)
+deriving instance Data (ImportDecl GhcTc)
+
+-- deriving instance (DataId name)             => Data (IE name)
+deriving instance Data (IE GhcPs)
+deriving instance Data (IE GhcRn)
+deriving instance Data (IE GhcTc)
+
+-- deriving instance (Eq name, Eq (IdP name)) => Eq (IE name)
+deriving instance Eq (IE GhcPs)
+deriving instance Eq (IE GhcRn)
+deriving instance Eq (IE GhcTc)
 
 -- ---------------------------------------------------------------------

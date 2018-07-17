@@ -37,6 +37,7 @@ import Type hiding ( getTvSubstEnv )
 import Coercion hiding ( getCvSubstEnv )
 import TyCon
 import TyCoRep hiding ( getTvSubstEnv, getCvSubstEnv )
+import FV( FV, fvVarSet, fvVarList )
 import Util
 import Pair
 import Outputable
@@ -546,7 +547,7 @@ During unification we use a TvSubstEnv/CvSubstEnv pair that is
 Note [Finding the substitution fixpoint]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Finding the fixpoint of a non-idempotent substitution arising from a
-unification is harder than it looks, because of kinds.  Consider
+unification is much trickier than it looks, because of kinds.  Consider
    T k (H k (f:k)) ~ T * (g:*)
 If we unify, we get the substitution
    [ k -> *
@@ -561,41 +562,96 @@ If we don't do this, we may apply the substitution to something,
 and get an ill-formed type, i.e. one where typeKind will fail.
 This happened, for example, in Trac #9106.
 
-This is the reason for extending env with [f:k -> f:*], in the
-definition of env' in niFixTvSubst
+It gets worse.  In Trac #14164 we wanted to take the fixpoint of
+this substitution
+   [ xs_asV :-> F a_aY6 (z_aY7 :: a_aY6)
+                        (rest_aWF :: G a_aY6 (z_aY7 :: a_aY6))
+   , a_aY6  :-> a_aXQ ]
+
+We have to apply the substitution for a_aY6 two levels deep inside
+the invocation of F!  We don't have a function that recursively
+applies substitutions inside the kinds of variable occurrences (and
+probably rightly so).
+
+So, we work as follows:
+
+ 1. Start with the current substitution (which we are
+    trying to fixpoint
+       [ xs :-> F a (z :: a) (rest :: G a (z :: a))
+       , a  :-> b ]
+
+ 2. Take all the free vars of the range of the substitution:
+       {a, z, rest, b}
+    NB: the free variable finder closes over
+    the kinds of variable occurrences
+
+ 3. If none are in the domain of the substitution, stop.
+    We have found a fixpoint.
+
+ 4. Remove the variables that are bound by the substitution, leaving
+       {z, rest, b}
+
+ 5. Do a topo-sort to put them in dependency order:
+       [ b :: *, z :: a, rest :: G a z ]
+
+ 6. Apply the substitution left-to-right to the kinds of these
+    tyvars, extending it each time with a new binding, so we
+    finish up with
+       [ xs   :-> ..as before..
+       , a    :-> b
+       , b    :-> b    :: *
+       , z    :-> z    :: b
+       , rest :-> rest :: G b (z :: b) ]
+    Note that rest now has the right kind
+
+ 7. Apply this extended substitution (once) to the range of
+    the /original/ substitution.  (Note that we do the
+    extended substitution would go on forever if you tried
+    to find its fixpoint, because it maps z to z.)
+
+ 8. And go back to step 1
+
+In Step 6 we use the free vars from Step 2 as the initial
+in-scope set, because all of those variables appear in the
+range of the substitution, so they must all be in the in-scope
+set.  But NB that the type substitution engine does not look up
+variables in the in-scope set; it is used only to ensure no
+shadowing.
 -}
 
 niFixTCvSubst :: TvSubstEnv -> TCvSubst
 -- Find the idempotent fixed point of the non-idempotent substitution
--- See Note [Finding the substitution fixpoint]
+-- This is surprisingly tricky:
+--   see Note [Finding the substitution fixpoint]
 -- ToDo: use laziness instead of iteration?
-niFixTCvSubst tenv = f tenv
+niFixTCvSubst tenv
+  | not_fixpoint = niFixTCvSubst (mapVarEnv (substTy subst) tenv)
+  | otherwise    = subst
   where
-    f tenv
-        | not_fixpoint = f (mapVarEnv (substTy subst') tenv)
-        | otherwise    = subst
-        where
-          not_fixpoint  = anyVarSet in_domain range_tvs
-          in_domain tv  = tv `elemVarEnv` tenv
+    range_fvs :: FV
+    range_fvs = tyCoFVsOfTypes (nonDetEltsUFM tenv)
+          -- It's OK to use nonDetEltsUFM here because the
+          -- order of range_fvs, range_tvs is immaterial
 
-          range_tvs     = nonDetFoldUFM (unionVarSet . tyCoVarsOfType) emptyVarSet tenv
-                          -- It's OK to use nonDetFoldUFM here because we
-                          -- forget the order immediately by creating a set
-          subst         = mkTvSubst (mkInScopeSet range_tvs) tenv
+    range_tvs :: [TyVar]
+    range_tvs = fvVarList range_fvs
 
-             -- env' extends env by replacing any free type with
-             -- that same tyvar with a substituted kind
-             -- See note [Finding the substitution fixpoint]
-          tenv'  = extendVarEnvList tenv [ (rtv, mkTyVarTy $
-                                                 setTyVarKind rtv $
-                                                 substTy subst $
-                                                 tyVarKind rtv)
-                                         | rtv <- nonDetEltsUniqSet range_tvs
-                                         -- It's OK to use nonDetEltsUniqSet here
-                                         -- because we forget the order
-                                         -- immediatedly by putting it in VarEnv
-                                         , not (in_domain rtv) ]
-          subst' = mkTvSubst (mkInScopeSet range_tvs) tenv'
+    not_fixpoint  = any in_domain range_tvs
+    in_domain tv  = tv `elemVarEnv` tenv
+
+    free_tvs = toposortTyVars (filterOut in_domain range_tvs)
+
+    -- See Note [Finding the substitution fixpoint], Step 6
+    init_in_scope = mkInScopeSet (fvVarSet range_fvs)
+    subst = foldl add_free_tv
+                  (mkTvSubst init_in_scope tenv)
+                  free_tvs
+
+    add_free_tv :: TCvSubst -> TyVar -> TCvSubst
+    add_free_tv subst tv
+      = extendTvSubst subst tv (mkTyVarTy tv')
+     where
+        tv' = updateTyVarKind (substTy subst) tv
 
 niSubstTvSet :: TvSubstEnv -> TyCoVarSet -> TyCoVarSet
 -- Apply the non-idempotent substitution to a set of type variables,
@@ -889,7 +945,7 @@ unify_ty env ty1 (TyVarTy tv2) kco
 unify_ty env ty1 ty2 _kco
   | Just (tc1, tys1) <- mb_tc_app1
   , Just (tc2, tys2) <- mb_tc_app2
-  , tc1 == tc2 || (tcIsStarKind ty1 && tcIsStarKind ty2)
+  , tc1 == tc2 || (tcIsLiftedTypeKind ty1 && tcIsLiftedTypeKind ty2)
   = if isInjectiveTyCon tc1 Nominal
     then unify_tys env tys1 tys2
     else do { let inj | isTypeFamilyTyCon tc1
@@ -1263,7 +1319,7 @@ data MatchEnv = ME { me_tmpls :: TyVarSet
                    , me_env   :: RnEnv2 }
 
 -- | 'liftCoMatch' is sort of inverse to 'liftCoSubst'.  In particular, if
---   @liftCoMatch vars ty co == Just s@, then @listCoSubst s ty == co@,
+--   @liftCoMatch vars ty co == Just s@, then @liftCoSubst s ty == co@,
 --   where @==@ there means that the result of 'liftCoSubst' has the same
 --   type as the original co; but may be different under the hood.
 --   That is, it matches a type against a coercion of the same
@@ -1336,9 +1392,6 @@ ty_co_match menv subst ty co lkco rkco
     ty_co_match menv subst ty' co (substed_co_l `mkTransCo` lkco)
                                   (substed_co_r `mkTransCo` rkco)
 
-  | CoherenceCo co1 co2 <- co
-  = ty_co_match menv subst ty co1 (lkco `mkTransCo` mkSymCo co2) rkco
-
   | SymCo co' <- co
   = swapLiftCoEnv <$> ty_co_match menv (swapLiftCoEnv subst) ty co' rkco lkco
 
@@ -1353,7 +1406,7 @@ ty_co_match menv subst (TyVarTy tv1) co lkco rkco
   = if any (inRnEnvR rn_env) (tyCoVarsOfCoList co)
     then Nothing      -- occurs check failed
     else Just $ extendVarEnv subst tv1' $
-                castCoercionKind co (mkSymCo lkco) (mkSymCo rkco)
+                castCoercionKindI co (mkSymCo lkco) (mkSymCo rkco)
 
   | otherwise
   = Nothing
@@ -1401,6 +1454,21 @@ ty_co_match menv subst (ForAllTy (TvBndr tv1 _) ty1)
 ty_co_match _ subst (CoercionTy {}) _ _ _
   = Just subst -- don't inspect coercions
 
+ty_co_match menv subst ty (GRefl r t (MCo co)) lkco rkco
+  =  ty_co_match menv subst ty (GRefl r t MRefl) lkco (rkco `mkTransCo` mkSymCo co)
+
+ty_co_match menv subst ty co1 lkco rkco
+  | Just (CastTy t co, r) <- isReflCo_maybe co1
+  -- In @pushRefl@, pushing reflexive coercion inside CastTy will give us
+  -- t |> co ~ t ; <t> ; t ~ t |> co
+  -- But transitive coercions are not helpful. Therefore we deal
+  -- with it here: we do recursion on the smaller reflexive coercion,
+  -- while propagating the correct kind coercions.
+  = let kco' = mkSymCo co
+    in ty_co_match menv subst ty (mkReflCo r t) (lkco `mkTransCo` kco')
+                                                (rkco `mkTransCo` kco')
+
+
 ty_co_match menv subst ty co lkco rkco
   | Just co' <- pushRefl co = ty_co_match menv subst ty co' lkco rkco
   | otherwise               = Nothing
@@ -1445,17 +1513,18 @@ ty_co_match_args menv subst (ty:tys) (arg:args) (lkco:lkcos) (rkco:rkcos)
 ty_co_match_args _    _     _        _          _ _ = Nothing
 
 pushRefl :: Coercion -> Maybe Coercion
-pushRefl (Refl Nominal (AppTy ty1 ty2))
-  = Just (AppCo (Refl Nominal ty1) (mkNomReflCo ty2))
-pushRefl (Refl r (FunTy ty1 ty2))
-  | Just rep1 <- getRuntimeRep_maybe ty1
-  , Just rep2 <- getRuntimeRep_maybe ty2
-  = Just (TyConAppCo r funTyCon [ mkReflCo r rep1, mkReflCo r rep2
-                                , mkReflCo r ty1,  mkReflCo r ty2 ])
-pushRefl (Refl r (TyConApp tc tys))
-  = Just (TyConAppCo r tc (zipWith mkReflCo (tyConRolesX r tc) tys))
-pushRefl (Refl r (ForAllTy (TvBndr tv _) ty))
-  = Just (mkHomoForAllCos_NoRefl [tv] (Refl r ty))
+pushRefl co =
+  case (isReflCo_maybe co) of
+    Just (AppTy ty1 ty2, Nominal)
+      -> Just (AppCo (mkReflCo Nominal ty1) (mkNomReflCo ty2))
+    Just (FunTy ty1 ty2, r)
+      | Just rep1 <- getRuntimeRep_maybe ty1
+      , Just rep2 <- getRuntimeRep_maybe ty2
+      ->  Just (TyConAppCo r funTyCon [ mkReflCo r rep1, mkReflCo r rep2
+                                       , mkReflCo r ty1,  mkReflCo r ty2 ])
+    Just (TyConApp tc tys, r)
+      -> Just (TyConAppCo r tc (zipWith mkReflCo (tyConRolesX r tc) tys))
+    Just (ForAllTy (TvBndr tv _) ty, r)
+      -> Just (mkHomoForAllCos_NoRefl [tv] (mkReflCo r ty))
     -- NB: NoRefl variant. Otherwise, we get a loop!
-pushRefl (Refl r (CastTy ty co))  = Just (castCoercionKind (Refl r ty) co co)
-pushRefl _                        = Nothing
+    _ -> Nothing

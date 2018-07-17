@@ -108,7 +108,7 @@ pprStackInfo (StackInfo {arg_space=arg_space, updfr_space=updfr_space}) =
 
 pprTopInfo :: CmmTopInfo -> SDoc
 pprTopInfo (TopInfo {info_tbls=info_tbl, stack_info=stack_info}) =
-  vcat [text "info_tbl: " <> ppr info_tbl,
+  vcat [text "info_tbls: " <> ppr info_tbl,
         text "stack_info: " <> ppr stack_info]
 
 ----------------------------------------------------------
@@ -185,9 +185,13 @@ pprNode node = pp_node <+> pp_debug
     pp_node :: SDoc
     pp_node = sdocWithDynFlags $ \dflags -> case node of
       -- label:
-      CmmEntry id tscope -> ppr id <> colon <+>
+      CmmEntry id tscope -> lbl <> colon <+>
          (sdocWithDynFlags $ \dflags ->
            ppUnless (gopt Opt_SuppressTicks dflags) (text "//" <+> ppr tscope))
+          where
+            lbl = if gopt Opt_SuppressUniques dflags
+                then text "_lbl_"
+                else ppr id
 
       -- // text
       CmmComment s -> text "//" <+> ftext s

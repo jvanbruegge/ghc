@@ -2025,6 +2025,17 @@ mostly obvious.
 
     It will create ``.ghci-history`` in current folder where GHCi is launched.
 
+.. ghc-flag:: -fghci-leak-check
+    :shortdesc: (Debugging only) check for space leaks when loading
+                new modules in GHCi.
+    :type: dynamic
+    :reverse: -fno-ghci-leak-check
+    :category:
+
+    (Debugging only) When loading new modules with ``:load``, check
+    that any previously loaded modules have been correctly garbage
+    collected. Emits messages if a leak is detected.
+
 Packages
 ~~~~~~~~
 
@@ -2362,6 +2373,14 @@ commonly used commands.
     Delete one or more breakpoints by number (use :ghci-cmd:`:show breaks` to
     see the number of each breakpoint). The ``*`` form deletes all the
     breakpoints.
+
+.. ghci-cmd:: :doc; ⟨name⟩
+
+    (Experimental: This command will likely change significantly in GHC 8.8.)
+
+    Displays the documentation for the given name. Currently the command is
+    restricted to displaying the documentation directly on the declaration
+    in question, ignoring documentation for arguments, constructors etc.
 
 .. ghci-cmd:: :edit; ⟨file⟩
 

@@ -36,6 +36,10 @@
 #if defined(HAVE_NUMAIF_H)
 #include <numaif.h>
 #endif
+#if defined(HAVE_SYS_RESOURCE_H) && defined(HAVE_SYS_TIME_H)
+#include <sys/time.h>
+#include <sys/resource.h>
+#endif
 
 #include <errno.h>
 
@@ -192,16 +196,18 @@ my_mmap (void *addr, W_ size, int operation)
         }
     }
 
-    if (operation & MEM_COMMIT) {
-        madvise(ret, size, MADV_WILLNEED);
+    if (ret != (void *)-1) {
+        if (operation & MEM_COMMIT) {
+            madvise(ret, size, MADV_WILLNEED);
 #if defined(MADV_DODUMP)
-        madvise(ret, size, MADV_DODUMP);
+            madvise(ret, size, MADV_DODUMP);
 #endif
-    } else {
-        madvise(ret, size, MADV_DONTNEED);
+        } else {
+            madvise(ret, size, MADV_DONTNEED);
 #if defined(MADV_DONTDUMP)
-        madvise(ret, size, MADV_DONTDUMP);
+            madvise(ret, size, MADV_DONTDUMP);
 #endif
+        }
     }
 
 #else
@@ -500,6 +506,15 @@ void *osReserveHeapMemory(void *startAddressPtr, W_ *len)
             (void*)startAddress, (void*)minimumAddress);
     }
 
+#if defined(HAVE_SYS_RESOURCE_H) && defined(HAVE_SYS_TIME_H)
+    struct rlimit limit;
+    if (!getrlimit(RLIMIT_AS, &limit)
+        && limit.rlim_cur > 0
+        && *len > limit.rlim_cur) {
+        *len = limit.rlim_cur;
+    }
+#endif
+
     attempt = 0;
     while (1) {
         if (*len < MBLOCK_SIZE) {
@@ -512,9 +527,14 @@ void *osReserveHeapMemory(void *startAddressPtr, W_ *len)
         if (at == NULL) {
             // This means that mmap failed which we take to mean that we asked
             // for too much memory. This can happen due to POSIX resource
-            // limits. In this case we reduce our allocation request by a factor
-            // of two and try again.
-            *len /= 2;
+            // limits. In this case we reduce our allocation request by a
+            // fraction of the current size and try again.
+            //
+            // Note that the previously would instead decrease the request size
+            // by a factor of two; however, this meant that significant amounts
+            // of memory will be wasted (e.g. imagine a machine with 512GB of
+            // physical memory but a 511GB ulimit). See #14492.
+            *len -= *len / 8;
         } else if ((W_)at >= minimumAddress) {
             // Success! We were given a block of memory starting above the 8 GB
             // mark, which is what we were looking for.
@@ -590,6 +610,15 @@ void osReleaseHeapMemory(void)
 }
 
 #endif
+
+bool osBuiltWithNumaSupport(void)
+{
+#if HAVE_LIBNUMA
+    return true;
+#else
+    return false;
+#endif
+}
 
 bool osNumaAvailable(void)
 {

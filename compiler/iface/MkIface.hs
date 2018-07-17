@@ -86,7 +86,6 @@ import HscTypes
 import Finder
 import DynFlags
 import VarEnv
-import VarSet
 import Var
 import Name
 import Avail
@@ -109,6 +108,7 @@ import Fingerprint
 import Exception
 import UniqSet
 import Packages
+import ExtractDocs
 
 import Control.Monad
 import Data.Function
@@ -118,6 +118,12 @@ import Data.Ord
 import Data.IORef
 import System.Directory
 import System.FilePath
+import Plugins ( PluginRecompile(..), Plugin(..), LoadedPlugin(..))
+#if __GLASGOW_HASKELL__ < 840
+--Qualified import so we can define a Semigroup instance
+-- but it doesn't clash with Outputable.<>
+import qualified Data.Semigroup
+#endif
 
 {-
 ************************************************************************
@@ -147,12 +153,17 @@ mkIface hsc_env maybe_old_fingerprint mod_details
                       mg_warns        = warns,
                       mg_hpc_info     = hpc_info,
                       mg_safe_haskell = safe_mode,
-                      mg_trust_pkg    = self_trust
+                      mg_trust_pkg    = self_trust,
+                      mg_doc_hdr      = doc_hdr,
+                      mg_decl_docs    = decl_docs,
+                      mg_arg_docs     = arg_docs
                     }
         = mkIface_ hsc_env maybe_old_fingerprint
                    this_mod hsc_src used_th deps rdr_env fix_env
                    warns hpc_info self_trust
-                   safe_mode usages mod_details
+                   safe_mode usages
+                   doc_hdr decl_docs arg_docs
+                   mod_details
 
 -- | make an interface from the results of typechecking only.  Useful
 -- for non-optimising compilation, or where we aren't generating any
@@ -177,7 +188,11 @@ mkIfaceTc hsc_env maybe_old_fingerprint safe_mode mod_details
                     }
   = do
           let used_names = mkUsedNames tc_result
-          deps <- mkDependencies tc_result
+          let pluginModules =
+                map lpModule (plugins (hsc_dflags hsc_env))
+          deps <- mkDependencies
+                    (thisInstalledUnitId (hsc_dflags hsc_env))
+                    pluginModules tc_result
           let hpc_info = emptyHpcInfo other_hpc_info
           used_th <- readIORef tc_splice_used
           dep_files <- (readIORef dependent_files)
@@ -189,11 +204,17 @@ mkIfaceTc hsc_env maybe_old_fingerprint safe_mode mod_details
           -- module and does not need to be recorded as a dependency.
           -- See Note [Identity versus semantic module]
           usages <- mkUsageInfo hsc_env this_mod (imp_mods imports) used_names dep_files merged
+
+          let (doc_hdr', doc_map, arg_map) = extractDocs tc_result
+
           mkIface_ hsc_env maybe_old_fingerprint
                    this_mod hsc_src
                    used_th deps rdr_env
                    fix_env warns hpc_info
-                   (imp_trust_own_pkg imports) safe_mode usages mod_details
+                   (imp_trust_own_pkg imports) safe_mode usages
+                   doc_hdr' doc_map arg_map
+                   mod_details
+
 
 
 mkIface_ :: HscEnv -> Maybe Fingerprint -> Module -> HscSource
@@ -202,16 +223,19 @@ mkIface_ :: HscEnv -> Maybe Fingerprint -> Module -> HscSource
          -> Bool
          -> SafeHaskellMode
          -> [Usage]
+         -> Maybe HsDocString
+         -> DeclDocMap
+         -> ArgDocMap
          -> ModDetails
          -> IO (ModIface, Bool)
 mkIface_ hsc_env maybe_old_fingerprint
          this_mod hsc_src used_th deps rdr_env fix_env src_warns
          hpc_info pkg_trust_req safe_mode usages
+         doc_hdr decl_docs arg_docs
          ModDetails{  md_insts     = insts,
                       md_fam_insts = fam_insts,
                       md_rules     = rules,
                       md_anns      = anns,
-                      md_vect_info = vect_info,
                       md_types     = type_env,
                       md_exports   = exports,
                       md_complete_sigs = complete_sigs }
@@ -246,7 +270,6 @@ mkIface_ hsc_env maybe_old_fingerprint
         iface_rules = map coreRuleToIfaceRule rules
         iface_insts = map instanceToIfaceInst $ fixSafeInstances safe_mode insts
         iface_fam_insts = map famInstToIfaceFamInst fam_insts
-        iface_vect_info = flattenVectInfo vect_info
         trust_info  = setSafeMode safe_mode
         annotations = map mkIfaceAnnotation anns
         icomplete_sigs = map mkIfaceCompleteSig complete_sigs
@@ -269,8 +292,6 @@ mkIface_ hsc_env maybe_old_fingerprint
               mi_fam_insts   = sortBy cmp_fam_inst iface_fam_insts,
               mi_rules       = sortBy cmp_rule     iface_rules,
 
-              mi_vect_info   = iface_vect_info,
-
               mi_fixities    = fixities,
               mi_warns       = warns,
               mi_anns        = annotations,
@@ -283,6 +304,7 @@ mkIface_ hsc_env maybe_old_fingerprint
               mi_opt_hash    = fingerprint0,
               mi_hpc_hash    = fingerprint0,
               mi_exp_hash    = fingerprint0,
+              mi_plugin_hash = fingerprint0,
               mi_used_th     = used_th,
               mi_orphan_hash = fingerprint0,
               mi_orphan      = False, -- Always set by addFingerprints, but
@@ -297,7 +319,10 @@ mkIface_ hsc_env maybe_old_fingerprint
               -- And build the cached values
               mi_warn_fn     = mkIfaceWarnCache warns,
               mi_fix_fn      = mkIfaceFixCache fixities,
-              mi_complete_sigs = icomplete_sigs }
+              mi_complete_sigs = icomplete_sigs,
+              mi_doc_hdr     = doc_hdr,
+              mi_decl_docs   = decl_docs,
+              mi_arg_docs    = arg_docs }
 
     (new_iface, no_change_at_all)
           <- {-# SCC "versioninfo" #-}
@@ -339,19 +364,6 @@ mkIface_ hsc_env maybe_old_fingerprint
      deliberatelyOmitted x = panic ("Deliberately omitted: " ++ x)
 
      ifFamInstTcName = ifFamInstFam
-
-     flattenVectInfo (VectInfo { vectInfoVar            = vVar
-                               , vectInfoTyCon          = vTyCon
-                               , vectInfoParallelVars     = vParallelVars
-                               , vectInfoParallelTyCons = vParallelTyCons
-                               }) =
-       IfaceVectInfo
-       { ifaceVectInfoVar            = [Var.varName v | (v, _  ) <- dVarEnvElts vVar]
-       , ifaceVectInfoTyCon          = [tyConName t   | (t, t_v) <- nameEnvElts vTyCon, t /= t_v]
-       , ifaceVectInfoTyConReuse     = [tyConName t   | (t, t_v) <- nameEnvElts vTyCon, t == t_v]
-       , ifaceVectInfoParallelVars   = [Var.varName v | v <- dVarSetElems vParallelVars]
-       , ifaceVectInfoParallelTyCons = nameSetElemsStable vParallelTyCons
-       }
 
 -----------------------------
 writeIfaceFile :: DynFlags -> FilePath -> ModIface -> IO ()
@@ -667,18 +679,18 @@ addFingerprints hsc_env mb_old_fingerprint iface0 new_decls
 
    hpc_hash <- fingerprintHpcFlags dflags putNameLiterally
 
+   plugin_hash <- fingerprintPlugins hsc_env
+
    -- the ABI hash depends on:
    --   - decls
    --   - export list
    --   - orphans
    --   - deprecations
-   --   - vect info
    --   - flag abi hash
    mod_hash <- computeFingerprint putNameLiterally
                       (map fst sorted_decls,
                        export_hash,  -- includes orphan_hash
-                       mi_warns iface0,
-                       mi_vect_info iface0)
+                       mi_warns iface0)
 
    -- The interface hash depends on:
    --   - the ABI hash, plus
@@ -704,11 +716,11 @@ addFingerprints hsc_env mb_old_fingerprint iface0 new_decls
                 mi_flag_hash   = flag_hash,
                 mi_opt_hash    = opt_hash,
                 mi_hpc_hash    = hpc_hash,
+                mi_plugin_hash = plugin_hash,
                 mi_orphan      = not (   all ifRuleAuto orph_rules
                                            -- See Note [Orphans and auto-generated rules]
                                       && null orph_insts
-                                      && null orph_fis
-                                      && isNoIfaceVectInfo (mi_vect_info iface0)),
+                                      && null orph_fis),
                 mi_finsts      = not . null $ mi_fam_insts iface0,
                 mi_decls       = sorted_decls,
                 mi_hash_fn     = lookupOccEnv local_env }
@@ -1093,6 +1105,16 @@ data RecompileRequired
        -- to force recompilation; the String says what (one-line summary)
    deriving Eq
 
+instance Semigroup RecompileRequired where
+  UpToDate <> r = r
+  mc <> _       = mc
+
+instance Monoid RecompileRequired where
+  mempty = UpToDate
+#if __GLASGOW_HASKELL__ < 840
+  mappend = (Data.Semigroup.<>)
+#endif
+
 recompileRequired :: RecompileRequired -> Bool
 recompileRequired UpToDate = False
 recompileRequired _ = True
@@ -1219,6 +1241,9 @@ checkVersions hsc_env mod_summary iface
        ; if recompileRequired recomp then return (recomp, Nothing) else do {
        ; recomp <- checkDependencies hsc_env mod_summary iface
        ; if recompileRequired recomp then return (recomp, Just iface) else do {
+       ; recomp <- checkPlugins hsc_env iface
+       ; if recompileRequired recomp then return (recomp, Nothing) else do {
+
 
        -- Source code unchanged and no errors yet... carry on
        --
@@ -1236,12 +1261,50 @@ checkVersions hsc_env mod_summary iface
        ; updateEps_ $ \eps  -> eps { eps_is_boot = mod_deps }
        ; recomp <- checkList [checkModUsage this_pkg u | u <- mi_usages iface]
        ; return (recomp, Just iface)
-    }}}}}}}}
+    }}}}}}}}}
   where
     this_pkg = thisPackage (hsc_dflags hsc_env)
     -- This is a bit of a hack really
     mod_deps :: ModuleNameEnv (ModuleName, IsBootInterface)
     mod_deps = mkModDeps (dep_mods (mi_deps iface))
+
+-- | Check if any plugins are requesting recompilation
+checkPlugins :: HscEnv -> ModIface -> IfG RecompileRequired
+checkPlugins hsc iface = liftIO $ do
+  -- [(ModuleName, Plugin, [Opts])]
+  let old_fingerprint = mi_plugin_hash iface
+      loaded_plugins = plugins (hsc_dflags hsc)
+  res <- mconcat <$> mapM checkPlugin loaded_plugins
+  return (pluginRecompileToRecompileRequired old_fingerprint res)
+
+fingerprintPlugins :: HscEnv -> IO Fingerprint
+fingerprintPlugins hsc_env = do
+  fingerprintPlugins' (plugins (hsc_dflags hsc_env))
+
+fingerprintPlugins' :: [LoadedPlugin] -> IO Fingerprint
+fingerprintPlugins' plugins = do
+  res <- mconcat <$> mapM checkPlugin plugins
+  return $ case res of
+      NoForceRecompile ->  fingerprintString "NoForceRecompile"
+      ForceRecompile   -> fingerprintString "ForceRecompile"
+      -- is the chance of collision worth worrying about?
+      -- An alternative is to fingerprintFingerprints [fingerprintString
+      -- "maybeRecompile", fp]
+      (MaybeRecompile fp) -> fp
+
+
+
+checkPlugin :: LoadedPlugin -> IO PluginRecompile
+checkPlugin (LoadedPlugin plugin _ opts) = pluginRecompile plugin opts
+
+pluginRecompileToRecompileRequired :: Fingerprint -> PluginRecompile -> RecompileRequired
+pluginRecompileToRecompileRequired old_fp pr =
+  case pr of
+    NoForceRecompile -> UpToDate
+    ForceRecompile   -> RecompBecause "Plugin forced recompilation"
+    MaybeRecompile fp  -> if fp == old_fp then UpToDate
+                                          else RecompBecause "Plugin fingerprint changed"
+
 
 -- | Check if an hsig file needs recompilation because its
 -- implementing module has changed.

@@ -28,7 +28,9 @@ import Name             ( mkSystemVarName, isExternalName, getOccFS )
 import Coercion hiding  ( substCo, substCoVar )
 import OptCoercion      ( optCoercion )
 import FamInstEnv       ( topNormaliseType_maybe )
-import DataCon          ( DataCon, dataConWorkId, dataConRepStrictness, dataConRepArgTys )
+import DataCon          ( DataCon, dataConWorkId, dataConRepStrictness
+                        , dataConRepArgTys, isUnboxedTupleCon
+                        , StrictnessMark (..) )
 import CoreMonad        ( Tick(..), SimplMode(..) )
 import CoreSyn
 import Demand           ( StrictSig(..), dmdTypeDepth, isStrictDmd )
@@ -50,6 +52,7 @@ import Pair
 import Util
 import ErrUtils
 import Module          ( moduleName, pprModuleName )
+import PrimOp          ( PrimOp (SeqOp) )
 
 
 {-
@@ -1012,8 +1015,9 @@ simplCoercionF env co cont
 
 simplCoercion :: SimplEnv -> InCoercion -> SimplM OutCoercion
 simplCoercion env co
-  = let opt_co = optCoercion (getTCvSubst env) co
-    in seqCo opt_co `seq` return opt_co
+  = do { dflags <- getDynFlags
+       ; let opt_co = optCoercion dflags (getTCvSubst env) co
+       ; seqCo opt_co `seq` return opt_co }
 
 -----------------------------------
 -- | Push a TickIt context outwards past applications and cases, as
@@ -1209,40 +1213,73 @@ rebuild env expr cont
 ************************************************************************
 -}
 
+{- Note [Optimising reflexivity]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+It's important (for compiler performance) to get rid of reflexivity as soon
+as it appears.  See Trac #11735, #14737, and #15019.
+
+In particular, we want to behave well on
+
+ *  e |> co1 |> co2
+    where the two happen to cancel out entirely. That is quite common;
+    e.g. a newtype wrapping and unwrapping cancel.
+
+
+ * (f |> co) @t1 @t2 ... @tn x1 .. xm
+   Here we wil use pushCoTyArg and pushCoValArg successively, which
+   build up NthCo stacks.  Silly to do that if co is reflexive.
+
+However, we don't want to call isReflexiveCo too much, because it uses
+type equality which is expensive on big types (Trac #14737 comment:7).
+
+A good compromise (determined experimentally) seems to be to call
+isReflexiveCo
+ * when composing casts, and
+ * at the end
+
+In investigating this I saw missed opportunities for on-the-fly
+coercion shrinkage. See Trac #15090.
+-}
+
+
 simplCast :: SimplEnv -> InExpr -> Coercion -> SimplCont
           -> SimplM (SimplFloats, OutExpr)
 simplCast env body co0 cont0
   = do  { co1   <- {-#SCC "simplCast-simplCoercion" #-} simplCoercion env co0
-        ; cont1 <- {-#SCC "simplCast-addCoerce" #-} addCoerce co1 cont0
+        ; cont1 <- {-#SCC "simplCast-addCoerce" #-}
+                   if isReflCo co1
+                   then return cont0  -- See Note [Optimising reflexivity]
+                   else addCoerce co1 cont0
         ; {-#SCC "simplCast-simplExprF" #-} simplExprF env body cont1 }
   where
-        -- If the first parameter is Nothing, then simplifying revealed a
+        -- If the first parameter is MRefl, then simplifying revealed a
         -- reflexive coercion. Omit.
-        addCoerce0 :: Maybe OutCoercion -> SimplCont -> SimplM SimplCont
-        addCoerce0 Nothing   cont = return cont
-        addCoerce0 (Just co) cont = addCoerce co cont
+        addCoerceM :: MOutCoercion -> SimplCont -> SimplM SimplCont
+        addCoerceM MRefl   cont = return cont
+        addCoerceM (MCo co) cont = addCoerce co cont
 
         addCoerce :: OutCoercion -> SimplCont -> SimplM SimplCont
-
-        addCoerce co1 (CastIt co2 cont)
-          = {-#SCC "addCoerce-simple-recursion" #-}
-            addCoerce (mkTransCo co1 co2) cont
+        addCoerce co1 (CastIt co2 cont)  -- See Note [Optimising reflexivity]
+          | isReflexiveCo co' = return cont
+          | otherwise         = addCoerce co' cont
+          where
+            co' = mkTransCo co1 co2
 
         addCoerce co cont@(ApplyToTy { sc_arg_ty = arg_ty, sc_cont = tail })
           | Just (arg_ty', m_co') <- pushCoTyArg co arg_ty
           = {-#SCC "addCoerce-pushCoTyArg" #-}
-            do { tail' <- addCoerce0 m_co' tail
+            do { tail' <- addCoerceM m_co' tail
                ; return (cont { sc_arg_ty = arg_ty', sc_cont = tail' }) }
 
         addCoerce co cont@(ApplyToVal { sc_arg = arg, sc_env = arg_se
-                                 , sc_dup = dup, sc_cont = tail })
+                                      , sc_dup = dup, sc_cont = tail })
           | Just (co1, m_co2) <- pushCoValArg co
           , Pair _ new_ty <- coercionKind co1
-          , not (isTypeLevPoly new_ty)  -- without this check, we get a lev-poly arg
+          , not (isTypeLevPoly new_ty)  -- Without this check, we get a lev-poly arg
                                         -- See Note [Levity polymorphism invariants] in CoreSyn
                                         -- test: typecheck/should_run/EtaExpandLevPoly
           = {-#SCC "addCoerce-pushCoValArg" #-}
-            do { tail' <- addCoerce0 m_co2 tail
+            do { tail' <- addCoerceM m_co2 tail
                ; if isReflCo co1
                  then return (cont { sc_cont = tail' })
                       -- Avoid simplifying if possible;
@@ -1260,15 +1297,10 @@ simplCast env body co0 cont0
                                     , sc_cont = tail' }) } }
 
         addCoerce co cont
-          | isReflexiveCo co = {-#SCC "addCoerce-reflexive" #-}
-                               return cont
-          | otherwise        = {-#SCC "addCoerce-other" #-}
-                               return (CastIt co cont)
-                 -- It's worth checking isReflexiveCo.
-                 -- For example, in the initial form of a worker
-                 -- we may find  (coerce T (coerce S (\x.e))) y
-                 -- and we'd like it to simplify to e[y/x] in one round
-                 -- of simplification
+          | isReflexiveCo co = return cont  -- Having this at the end makes a huge
+                                            -- difference in T12227, for some reason
+                                            -- See Note [Optimising reflexivity]
+          | otherwise        = return (CastIt co cont)
 
 simplArg :: SimplEnv -> DupFlag -> StaticEnv -> CoreExpr
          -> SimplM (DupFlag, StaticEnv, OutExpr)
@@ -1696,7 +1728,7 @@ simplIdF env var cont
 
 completeCall :: SimplEnv -> OutId -> SimplCont -> SimplM (SimplFloats, OutExpr)
 completeCall env var cont
-  | Just expr <- callSiteInline dflags var unfolding
+  | Just expr <- callSiteInline dflags var active_unf
                                 lone_variable arg_infos interesting_cont
   -- Inline the variable's RHS
   = do { checkedTick (UnfoldingDone var)
@@ -1706,7 +1738,7 @@ completeCall env var cont
   | otherwise
   -- Don't inline; instead rebuild the call
   = do { rule_base <- getSimplRules
-       ; let info = mkArgInfo var (getRules rule_base var)
+       ; let info = mkArgInfo env var (getRules rule_base var)
                               n_val_args call_cont
        ; rebuildCall env info cont }
 
@@ -1715,7 +1747,7 @@ completeCall env var cont
     (lone_variable, arg_infos, call_cont) = contArgs cont
     n_val_args       = length arg_infos
     interesting_cont = interestingCallContext env call_cont
-    unfolding        = activeUnfolding (getMode env) var
+    active_unf       = activeUnfolding (getMode env) var
 
     dump_inline unfolding cont
       | not (dopt Opt_D_dump_inlinings dflags) = return ()
@@ -2571,11 +2603,8 @@ simplAlt env scrut' _ case_bndr' cont' (LitAlt lit, bndrs, rhs)
         ; return (LitAlt lit, [], rhs') }
 
 simplAlt env scrut' _ case_bndr' cont' (DataAlt con, vs, rhs)
-  = do  {       -- Deal with the pattern-bound variables
-                -- Mark the ones that are in ! positions in the
-                -- data constructor as certainly-evaluated.
-                -- NB: simplLamBinders preserves this eval info
-        ; let vs_with_evals = add_evals (dataConRepStrictness con)
+  = do  { -- See Note [Adding evaluatedness info to pattern-bound variables]
+          let vs_with_evals = addEvals scrut' con vs
         ; (env', vs') <- simplLamBndrs env vs_with_evals
 
                 -- Bind the case-binder to (con args)
@@ -2586,37 +2615,75 @@ simplAlt env scrut' _ case_bndr' cont' (DataAlt con, vs, rhs)
         ; env'' <- addAltUnfoldings env' scrut' case_bndr' con_app
         ; rhs' <- simplExprC env'' rhs cont'
         ; return (DataAlt con, vs', rhs') }
-  where
-        -- add_evals records the evaluated-ness of the bound variables of
-        -- a case pattern.  This is *important*.  Consider
-        --      data T = T !Int !Int
-        --
-        --      case x of { T a b -> T (a+1) b }
-        --
-        -- We really must record that b is already evaluated so that we don't
-        -- go and re-evaluate it when constructing the result.
-        -- See Note [Data-con worker strictness] in MkId.hs
-    add_evals the_strs
-        = go vs the_strs
-        where
-          go [] [] = []
-          go (v:vs') strs | isTyVar v = v : go vs' strs
-          go (v:vs') (str:strs) = zap str v : go vs' strs
-          go _ _ = pprPanic "cat_evals"
-                    (ppr con $$
-                     ppr vs  $$
-                     ppr_with_length the_strs $$
-                     ppr_with_length (dataConRepArgTys con) $$
-                     ppr_with_length (dataConRepStrictness con))
-            where
-              ppr_with_length list
-                = ppr list <+> parens (text "length =" <+> ppr (length list))
-                                    -- NB: If this panic triggers, note that
-                                    -- NoStrictnessMark doesn't print!
 
-          zap str v = setCaseBndrEvald str $ -- Add eval'dness info
-                      zapIdOccInfo v         -- And kill occ info;
-                                             -- see Note [Case alternative occ info]
+{- Note [Adding evaluatedness info to pattern-bound variables]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+addEvals records the evaluated-ness of the bound variables of
+a case pattern.  This is *important*.  Consider
+
+     data T = T !Int !Int
+
+     case x of { T a b -> T (a+1) b }
+
+We really must record that b is already evaluated so that we don't
+go and re-evaluate it when constructing the result.
+See Note [Data-con worker strictness] in MkId.hs
+
+NB: simplLamBinders preserves this eval info
+
+In addition to handling data constructor fields with !s, addEvals
+also records the fact that the result of seq# is always in WHNF.
+See Note [seq# magic] in PrelRules.  Example (Trac #15226):
+
+  case seq# v s of
+    (# s', v' #) -> E
+
+we want the compiler to be aware that v' is in WHNF in E.
+
+Open problem: we don't record that v itself is in WHNF (and we can't
+do it here).  The right thing is to do some kind of binder-swap;
+see Trac #15226 for discussion.
+-}
+
+addEvals :: Maybe OutExpr -> DataCon -> [Id] -> [Id]
+-- See Note [Adding evaluatedness info to pattern-bound variables]
+addEvals scrut con vs
+  -- Deal with seq# applications
+  | Just scr <- scrut
+  , isUnboxedTupleCon con
+  , [s,x] <- vs
+    -- Use stripNArgs rather than collectArgsTicks to avoid building
+    -- a list of arguments only to throw it away immediately.
+  , Just (Var f) <- stripNArgs 4 scr
+  , Just SeqOp <- isPrimOpId_maybe f
+  , let x' = zapIdOccInfoAndSetEvald MarkedStrict x
+  = [s, x']
+
+  -- Deal with banged datacon fields
+addEvals _scrut con vs = go vs the_strs
+    where
+      the_strs = dataConRepStrictness con
+
+      go [] [] = []
+      go (v:vs') strs | isTyVar v = v : go vs' strs
+      go (v:vs') (str:strs) = zapIdOccInfoAndSetEvald str v : go vs' strs
+      go _ _ = pprPanic "Simplify.addEvals"
+                (ppr con $$
+                 ppr vs  $$
+                 ppr_with_length (map strdisp the_strs) $$
+                 ppr_with_length (dataConRepArgTys con) $$
+                 ppr_with_length (dataConRepStrictness con))
+        where
+          ppr_with_length list
+            = ppr list <+> parens (text "length =" <+> ppr (length list))
+          strdisp MarkedStrict = "MarkedStrict"
+          strdisp NotMarkedStrict = "NotMarkedStrict"
+
+zapIdOccInfoAndSetEvald :: StrictnessMark -> Id -> Id
+zapIdOccInfoAndSetEvald str v =
+  setCaseBndrEvald str $ -- Add eval'dness info
+  zapIdOccInfo v         -- And kill occ info;
+                         -- see Note [Case alternative occ info]
 
 addAltUnfoldings :: SimplEnv -> Maybe OutExpr -> OutId -> OutExpr -> SimplM SimplEnv
 addAltUnfoldings env scrut case_bndr con_app
@@ -3292,7 +3359,7 @@ simplLetUnfolding env top_lvl cont_mb id new_rhs rhs_ty unf
   | isStableUnfolding unf
   = simplStableUnfolding env top_lvl cont_mb id unf rhs_ty
   | isExitJoinId id
-  = return noUnfolding -- see Note [Do not inline exit join points]
+  = return noUnfolding -- See Note [Do not inline exit join points] in Exitify
   | otherwise
   = mkLetUnfolding (seDynFlags env) top_lvl InlineRhs id new_rhs
 

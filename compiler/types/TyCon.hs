@@ -152,9 +152,10 @@ import FastStringEnv
 import FieldLabel
 import Constants
 import Util
-import Unique( tyConRepNameUnique, dataConRepNameUnique )
+import Unique( tyConRepNameUnique, dataConTyRepNameUnique )
 import UniqSet
 import Module
+import {-# SOURCE #-} DataCon
 
 import qualified Data.Data as Data
 
@@ -390,7 +391,7 @@ See also:
 -}
 
 type TyConBinder = TyVarBndr TyVar TyConBndrVis
-                   -- See also Note [TyBinder] in TyCoRep
+                   -- See also Note [TyBinders] in TyCoRep
 
 data TyConBndrVis
   = NamedTCB ArgFlag
@@ -1190,7 +1191,10 @@ tyConRepName_maybe (AlgTyCon { algTcParent = parent })
   | UnboxedAlgTyCon rep_nm <- parent = rep_nm
 tyConRepName_maybe (FamilyTyCon { famTcFlav = DataFamilyTyCon rep_nm })
   = Just rep_nm
-tyConRepName_maybe (PromotedDataCon { tcRepName = rep_nm })
+tyConRepName_maybe (PromotedDataCon { dataCon = dc, tcRepName = rep_nm })
+  | isUnboxedSumCon dc   -- see #13276
+  = Nothing
+  | otherwise
   = Just rep_nm
 tyConRepName_maybe _ = Nothing
 
@@ -1205,7 +1209,7 @@ mkPrelTyConRepName tc_name  -- Prelude tc_name is always External,
     name_mod  = nameModule  tc_name
     name_uniq = nameUnique  tc_name
     rep_uniq | isTcOcc name_occ = tyConRepNameUnique   name_uniq
-             | otherwise        = dataConRepNameUnique name_uniq
+             | otherwise        = dataConTyRepNameUnique name_uniq
     (rep_mod, rep_occ) = tyConRepModOcc name_mod name_occ
 
 -- | The name (and defining module) for the Typeable representation (TyCon) of a
@@ -1416,7 +1420,7 @@ So we compromise, and move their Kind calculation to the call site.
 -}
 
 -- | Given the name of the function type constructor and it's kind, create the
--- corresponding 'TyCon'. It is recomended to use 'TyCoRep.funTyCon' if you want
+-- corresponding 'TyCon'. It is recommended to use 'TyCoRep.funTyCon' if you want
 -- this functionality
 mkFunTyCon :: Name -> [TyConBinder] -> Name -> TyCon
 mkFunTyCon name binders rep_nm
@@ -2028,18 +2032,14 @@ isKindTyCon tc = getUnique tc `elementOfUniqSet` kindTyConKeys
 -- -XDataKinds.
 kindTyConKeys :: UniqSet Unique
 kindTyConKeys = unionManyUniqSets
-  ( mkUniqSet [ liftedTypeKindTyConKey, starKindTyConKey, unicodeStarKindTyConKey
-              , constraintKindTyConKey, tYPETyConKey ]
+  ( mkUniqSet [ liftedTypeKindTyConKey, constraintKindTyConKey, tYPETyConKey ]
   : map (mkUniqSet . tycon_with_datacons) [ runtimeRepTyCon
                                           , vecCountTyCon, vecElemTyCon ] )
   where
     tycon_with_datacons tc = getUnique tc : map getUnique (tyConDataCons tc)
 
 isLiftedTypeKindTyConName :: Name -> Bool
-isLiftedTypeKindTyConName
-  = (`hasKey` liftedTypeKindTyConKey) <||>
-    (`hasKey` starKindTyConKey) <||>
-    (`hasKey` unicodeStarKindTyConKey)
+isLiftedTypeKindTyConName = (`hasKey` liftedTypeKindTyConKey)
 
 -- | Identifies implicit tycons that, in particular, do not go into interface
 -- files (because they are implicitly reconstructed when the interface is
@@ -2552,7 +2552,7 @@ data RecTcChecker = RC !Int (NameEnv Int)
   -- we have encountered each TyCon
 
 initRecTc :: RecTcChecker
--- Intialise with a fixed max bound of 100
+-- Initialise with a fixed max bound of 100
 -- We should probably have a flag for this
 initRecTc = RC 100 emptyNameEnv
 
