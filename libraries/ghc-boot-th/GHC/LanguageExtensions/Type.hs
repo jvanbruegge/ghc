@@ -138,4 +138,5 @@ data Extension
    | NumericUnderscores
    | QuantifiedConstraints
    | StarIsType
+   | RowPolymorphism
    deriving (Eq, Enum, Show, Generic)

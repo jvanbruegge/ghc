@@ -912,6 +912,7 @@ type family XParTy           x
 type family XIParamTy        x
 type family XStarTy          x
 type family XKindSig         x
+type family XRowTy           x
 type family XSpliceTy        x
 type family XDocTy           x
 type family XBangTy          x
@@ -938,6 +939,7 @@ type ForallXType (c :: * -> Constraint) (x :: *) =
        , c (XIParamTy        x)
        , c (XStarTy          x)
        , c (XKindSig         x)
+       , c (XRowTy           x)
        , c (XSpliceTy        x)
        , c (XDocTy           x)
        , c (XBangTy          x)

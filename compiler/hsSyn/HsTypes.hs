@@ -604,6 +604,17 @@ data HsType pass
 
       -- For details on above see note [Api annotations] in ApiAnnotation
 
+  | HsRowTy             (XRowTy pass)
+                        (Located HsIPName) -- (x :: ty |)
+                        (LHsType pass) -- A unary row type
+      -- ^
+      -- > (x :: ty)
+      --
+      -- - 'ApiAnnotation.AnnKeywordId' : 'ApiAnnotation.AnnOpen' @'('@,
+      --         'ApiAnnotation.AnnDcolon','ApiAnnotation.AnnClose' @')'@
+
+      -- For details on above see note [Api annotations] in ApiAnnotation
+
   | HsSpliceTy          (XSpliceTy pass)
                         (HsSplice pass)   -- Includes quasi-quotes
       -- ^ - 'ApiAnnotation.AnnKeywordId' : 'ApiAnnotation.AnnOpen' @'$('@,
@@ -695,6 +706,7 @@ type instance XParTy           (GhcPass _) = NoExt
 type instance XIParamTy        (GhcPass _) = NoExt
 type instance XStarTy          (GhcPass _) = NoExt
 type instance XKindSig         (GhcPass _) = NoExt
+type instance XRowTy           (GhcPass _) = NoExt
 
 type instance XSpliceTy        GhcPs = NoExt
 type instance XSpliceTy        GhcRn = NoExt

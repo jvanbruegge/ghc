@@ -1965,6 +1965,8 @@ atype :: { LHsType GhcPs }
                                              [mo $1,mc $3] }
         | '[' ctype ']'               {% ams (sLL $1 $> $ HsListTy  noExt $2) [mos $1,mcs $3] }
         | '(' ctype ')'               {% ams (sLL $1 $> $ HsParTy   noExt $2) [mop $1,mcp $3] }
+        | '(' ipvar '::' type '|' ')' {% ams (sLL $1 $> $ HsRowTy   noExt $2 $4)
+                                             [mop $1, mu AnnDcolon $3, mu AnnVbar $5, mcp $6] }
         | '(' ctype '::' kind ')'     {% ams (sLL $1 $> $ HsKindSig noExt $2 $4)
                                              [mop $1,mu AnnDcolon $3,mcp $5] }
         | quasiquote                  { sL1 $1 (HsSpliceTy noExt (unLoc $1) ) }
