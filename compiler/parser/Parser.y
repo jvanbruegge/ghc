@@ -87,7 +87,7 @@ import GhcPrelude
 import qualified GHC.LanguageExtensions as LangExt
 }
 
-%expect 235 -- shift/reduce conflicts
+%expect 255 -- shift/reduce conflicts
 
 {- Last updated: 04 June 2018
 
@@ -1951,12 +1951,12 @@ atype :: { LHsType GhcPs }
         | '(' ')'                        {% ams (sLL $1 $> $ HsTupleTy noExt
                                                     HsBoxedOrConstraintTuple [])
                                                 [mop $1,mcp $2] }
-        | '(' ctype ',' comma_types1 ')' {% addAnnotation (gl $2) AnnComma
-                                                          (gl $3) >>
-                                            ams (sLL $1 $> $ HsTupleTy noExt
-
-                                             HsBoxedOrConstraintTuple ($2 : $4))
-                                                [mop $1,mcp $5] }
+--        | '(' ctype ',' comma_types1 ')' {% addAnnotation (gl $2) AnnComma
+--                                                          (gl $3) >>
+--                                            ams (sLL $1 $> $ HsTupleTy noExt
+--
+--                                             HsBoxedOrConstraintTuple ($2 : $4))
+--                                                [mop $1,mcp $5] }
         | '(#' '#)'                   {% ams (sLL $1 $> $ HsTupleTy noExt HsUnboxedTuple [])
                                              [mo $1,mc $2] }
         | '(#' comma_types1 '#)'      {% ams (sLL $1 $> $ HsTupleTy noExt HsUnboxedTuple $2)
@@ -1964,9 +1964,9 @@ atype :: { LHsType GhcPs }
         | '(#' bar_types2 '#)'        {% ams (sLL $1 $> $ HsSumTy noExt $2)
                                              [mo $1,mc $3] }
         | '[' ctype ']'               {% ams (sLL $1 $> $ HsListTy  noExt $2) [mos $1,mcs $3] }
-        | '(' ctype ')'               {% ams (sLL $1 $> $ HsParTy   noExt $2) [mop $1,mcp $3] }
-        | '(' ctype '::' kind ')'     {% ams (sLL $1 $> $ HsKindSig noExt $2 $4)
-                                             [mop $1,mu AnnDcolon $3,mcp $5] }
+--        | '(' ctype ')'               {% ams (sLL $1 $> $ HsParTy   noExt $2) [mop $1,mcp $3] }
+        | '(' rowdecls ')'            {% ams (sLL $1 $> $ HsRowTy noExt $2)
+                                              [moc $1,mcc $3] }
         | quasiquote                  { sL1 $1 (HsSpliceTy noExt (unLoc $1) ) }
         | '$(' exp ')'                {% ams (sLL $1 $> $ mkHsSpliceTy HasParens $2)
                                              [mj AnnOpenPE $1,mj AnnCloseP $3] }
@@ -2217,6 +2217,18 @@ fielddecl :: { LConDeclField GhcPs }
         : maybe_docnext sig_vars '::' ctype maybe_docprev
             {% ams (L (comb2 $2 $4)
                       (ConDeclField noExt (reverse (map (\ln@(L l n) -> L l $ FieldOcc noExt ln) (unLoc $2))) $4 ($1 `mplus` $5)))
+                   [mu AnnDcolon $3] }
+
+rowdecls :: { [LRowDeclField GhcPs] }
+          : rowdecl maybe_docnext ',' maybe_docprev rowdecls
+              {% addAnnotation (gl $1) AnnComma (gl $3) >>
+                 return ((addRowFieldDoc $1 $4) : addRowFieldDocs $5 $2) }
+          | rowdecl       { [$1] }
+
+rowdecl :: { LRowDeclField GhcPs }
+        : maybe_docnext var '::' ctype maybe_docprev
+            {% ams (L (comb2 $2 $4)
+                      (RowDeclField noExt (L (comb2 $2 $4) (mkRowFieldOcc $2)) $4 ($1 `mplus` $5)))
                    [mu AnnDcolon $3] }
 
 -- Reversed!

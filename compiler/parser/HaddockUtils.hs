@@ -19,6 +19,14 @@ addFieldDocs :: [LConDeclField a] -> Maybe LHsDocString -> [LConDeclField a]
 addFieldDocs [] _ = []
 addFieldDocs (x:xs) doc = addFieldDoc x doc : xs
 
+addRowFieldDoc :: LRowDeclField a -> Maybe LHsDocString -> LRowDeclField a
+addRowFieldDoc (L l fld) doc
+  = L l (fld { rd_fld_doc = rd_fld_doc fld `mplus` doc })
+
+addRowFieldDocs :: [LRowDeclField a] -> Maybe LHsDocString -> [LRowDeclField a]
+addRowFieldDocs [] _ = []
+addRowFieldDocs (x:xs) doc = addRowFieldDoc x doc : xs
+
 
 addConDoc :: LConDecl a -> Maybe LHsDocString -> LConDecl a
 addConDoc decl    Nothing = decl

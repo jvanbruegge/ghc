@@ -35,6 +35,7 @@ module HsTypes (
         getBangType, getBangStrictness,
 
         ConDeclField(..), LConDeclField, pprConDeclFields,
+        RowDeclField(..), LRowDeclField,
 
         HsConDetails(..),
 
@@ -42,6 +43,7 @@ module HsTypes (
         AmbiguousFieldOcc(..), mkAmbiguousFieldOcc,
         rdrNameAmbiguousFieldOcc, selectorAmbiguousFieldOcc,
         unambiguousFieldOcc, ambiguousFieldOcc,
+        RowFieldOcc(..), LRowFieldOcc, mkRowFieldOcc,
 
         HsWildCardInfo(..), mkAnonWildCardTy, pprAnonWildCard,
         wildCardName, sameWildCard,
@@ -631,6 +633,12 @@ data HsType pass
       -- ^ - 'ApiAnnotation.AnnKeywordId' : 'ApiAnnotation.AnnOpen' @'{'@,
       --         'ApiAnnotation.AnnClose' @'}'@
 
+  | HsRowTy     (XRowTy pass)
+                [LRowDeclField pass]
+      -- ^ - 'ApiAnnotation.AnnKeywordId' : 'ApiAnnotation.AnnOpen' @'('@,
+      --         'ApiAnnotation.AnnClose' @')'@
+
+
       -- For details on above see note [Api annotations] in ApiAnnotation
 
   -- | HsCoreTy (XCoreTy pass) Type -- An escape hatch for tunnelling a *closed*
@@ -703,6 +711,7 @@ type instance XSpliceTy        GhcTc = Kind
 type instance XDocTy           (GhcPass _) = NoExt
 type instance XBangTy          (GhcPass _) = NoExt
 type instance XRecTy           (GhcPass _) = NoExt
+type instance XRowTy           (GhcPass _) = NoExt
 
 type instance XExplicitListTy  GhcPs = NoExt
 type instance XExplicitListTy  GhcRn = NoExt
@@ -901,6 +910,52 @@ instance (Outputable arg, Outputable rec)
   ppr (PrefixCon args) = text "PrefixCon" <+> ppr args
   ppr (RecCon rec)     = text "RecCon:" <+> ppr rec
   ppr (InfixCon l r)   = text "InfixCon:" <+> ppr [l, r]
+
+-- | Located Constructor Declaration Field
+type LRowDeclField pass = Located (RowDeclField pass)
+      -- ^ May have 'ApiAnnotation.AnnKeywordId' : 'ApiAnnotation.AnnComma' when
+      --   in a list
+
+      -- For details on above see note [Api annotations] in ApiAnnotation
+
+-- | Constructor Declaration Field
+data RowDeclField pass  -- Record fields have Haddoc docs on them
+  = RowDeclField { rd_fld_ext  :: XRowDeclField pass,
+                   rd_fld_name :: LRowFieldOcc pass,
+                   rd_fld_type :: LBangType pass,
+                   rd_fld_doc  :: Maybe LHsDocString }
+      -- ^ - 'ApiAnnotation.AnnKeywordId' : 'ApiAnnotation.AnnDcolon'
+
+      -- For details on above see note [Api annotations] in ApiAnnotation
+  | XRowDeclField (XXRowDeclField pass)
+
+type instance XRowDeclField  (GhcPass _) = NoExt
+type instance XXRowDeclField (GhcPass _) = NoExt
+
+-- | Located Field Occurrence
+type LRowFieldOcc pass = Located (RowFieldOcc pass)
+
+data RowFieldOcc pass = RowFieldOcc { extRowFieldOcc     :: XCRowFieldOcc pass
+                                    , rdrNameRowFieldOcc :: Located RdrName
+                                        -- ^ See Note [Located RdrNames] in HsExpr
+                                    }
+
+  | XRowFieldOcc (XXRowFieldOcc pass)
+deriving instance (p ~ GhcPass pass, Eq (XCRowFieldOcc p)) => Eq  (RowFieldOcc p)
+deriving instance (p ~ GhcPass pass, Ord (XCRowFieldOcc p)) => Ord (RowFieldOcc p)
+
+type instance XCRowFieldOcc GhcPs = NoExt
+type instance XCRowFieldOcc GhcRn = NoExt
+type instance XCRowFieldOcc GhcTc = Id
+
+type instance XXRowFieldOcc (GhcPass _) = NoExt
+
+instance Outputable (RowFieldOcc pass) where
+  ppr = ppr . rdrNameRowFieldOcc
+
+mkRowFieldOcc :: Located RdrName -> RowFieldOcc GhcPs
+mkRowFieldOcc rdr = RowFieldOcc noExt rdr
+
 
 {-
 Note [ConDeclField passs]

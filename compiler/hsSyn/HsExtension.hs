@@ -916,6 +916,7 @@ type family XSpliceTy        x
 type family XDocTy           x
 type family XBangTy          x
 type family XRecTy           x
+type family XRowTy           x
 type family XExplicitListTy  x
 type family XExplicitTupleTy x
 type family XTyLit           x
@@ -971,6 +972,9 @@ type ForallXConDeclField (c :: * -> Constraint) (x :: *) =
        , c (XXConDeclField x)
        )
 
+type family XRowDeclField  x
+type family XXRowDeclField x
+
 -- ---------------------------------------------------------------------
 
 type family XCFieldOcc x
@@ -981,6 +985,8 @@ type ForallXFieldOcc (c :: * -> Constraint) (x :: *) =
        , c (XXFieldOcc x)
        )
 
+type family XCRowFieldOcc x
+type family XXRowFieldOcc x
 
 -- =====================================================================
 -- Type families for the HsImpExp type families
