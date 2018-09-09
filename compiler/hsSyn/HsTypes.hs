@@ -36,6 +36,7 @@ module HsTypes (
 
         ConDeclField(..), LConDeclField, pprConDeclFields,
         RowDeclField(..), LRowDeclField,
+        RowDecl(..), LRowDecl,
 
         HsConDetails(..),
 
@@ -634,7 +635,7 @@ data HsType pass
       --         'ApiAnnotation.AnnClose' @'}'@
 
   | HsRowTy     (XRowTy pass)
-                [LRowDeclField pass]
+                (LRowDecl pass)
       -- ^ - 'ApiAnnotation.AnnKeywordId' : 'ApiAnnotation.AnnOpen' @'('@,
       --         'ApiAnnotation.AnnClose' @')'@
 
@@ -910,6 +911,12 @@ instance (Outputable arg, Outputable rec)
   ppr (PrefixCon args) = text "PrefixCon" <+> ppr args
   ppr (RecCon rec)     = text "RecCon:" <+> ppr rec
   ppr (InfixCon l r)   = text "InfixCon:" <+> ppr [l, r]
+
+type LRowDecl pass = Located (RowDecl pass)
+
+data RowDecl pass
+  = RowDecl { rd_fields    :: [LRowDeclField pass],
+              rd_extension :: Maybe (Located RdrName) }
 
 -- | Located Constructor Declaration Field
 type LRowDeclField pass = Located (RowDeclField pass)

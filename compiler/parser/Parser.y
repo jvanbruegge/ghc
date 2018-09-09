@@ -2219,11 +2219,15 @@ fielddecl :: { LConDeclField GhcPs }
                       (ConDeclField noExt (reverse (map (\ln@(L l n) -> L l $ FieldOcc noExt ln) (unLoc $2))) $4 ($1 `mplus` $5)))
                    [mu AnnDcolon $3] }
 
-rowdecls :: { [LRowDeclField GhcPs] }
+rowdecls :: { LRowDecl GhcPs }
           : rowdecl maybe_docnext ',' maybe_docprev rowdecls
               {% addAnnotation (gl $1) AnnComma (gl $3) >>
-                 return ((addRowFieldDoc $1 $4) : addRowFieldDocs $5 $2) }
-          | rowdecl       { [$1] }
+                 return (sL (comb2 $1 $5) (RowDecl ((addRowFieldDoc $1 $4) : addRowFieldDocs (rd_fields (unLoc $5)) $2) (rd_extension (unLoc $5)))) }
+          | rowdecl row_ext      { sL1 $1 (RowDecl [$1] $2) }
+
+row_ext :: { Maybe (Located RdrName) }
+        : {- empty -}     { Nothing }
+        | '|' var         { Just $2 }
 
 rowdecl :: { LRowDeclField GhcPs }
         : maybe_docnext var '::' ctype maybe_docprev

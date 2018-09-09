@@ -387,6 +387,11 @@ deriving instance Data (ConDeclField GhcPs)
 deriving instance Data (ConDeclField GhcRn)
 deriving instance Data (ConDeclField GhcTc)
 
+-- deriving instance (DataIdLR p p) => Data (RowDecl p)
+deriving instance Data (RowDecl GhcPs)
+deriving instance Data (RowDecl GhcRn)
+deriving instance Data (RowDecl GhcTc)
+
 -- deriving instance (DataIdLR p p) => Data (RowDeclField p)
 deriving instance Data (RowDeclField GhcPs)
 deriving instance Data (RowDeclField GhcRn)

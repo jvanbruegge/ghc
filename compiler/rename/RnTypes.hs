@@ -1777,6 +1777,10 @@ extract_mb f (Just x) acc = f x acc
 extract_lkind :: LHsType GhcPs -> FreeKiTyVars -> RnM FreeKiTyVars
 extract_lkind = extract_lty KindLevel
 
+maybeToBool :: Maybe a -> Bool
+maybeToBool Nothing = False
+maybeToBool _ = True
+
 extract_lty :: TypeOrKind -> LHsType GhcPs
             -> FreeKiTyVarsWithDups -> RnM FreeKiTyVarsWithDups
 extract_lty t_or_k (L _ ty) acc
@@ -1786,6 +1790,7 @@ extract_lty t_or_k (L _ ty) acc
       HsRecTy _ flds              -> foldrM (extract_lty t_or_k
                                              . cd_fld_type . unLoc) acc
                                            flds
+      HsRowTy _ decl              -> error $ "\n***********************\nYou bastard did not implement the renaming yet!\n***********************\n\nLength of row: " ++ (show $ length $ rd_fields $ unLoc decl) ++ "\n\nHas extension: " ++ (show $ maybeToBool $ rd_extension $ unLoc decl) ++ "\n\n"
       HsAppTy _ ty1 ty2           -> extract_lty t_or_k ty1 =<<
                                      extract_lty t_or_k ty2 acc
       HsListTy _ ty               -> extract_lty t_or_k ty acc
